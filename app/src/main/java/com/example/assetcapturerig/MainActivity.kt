@@ -1,7 +1,6 @@
 package com.example.assetcapturerig
 
 import android.content.Context
-import android.content.res.AssetFileDescriptor
 import android.graphics.*
 import android.media.AudioManager
 import android.media.ToneGenerator
@@ -25,18 +24,31 @@ import io.github.sceneview.ar.ARSceneView
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
-import org.tensorflow.lite.Interpreter
+import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.channels.FileChannel
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import kotlin.math.*
 
 class MainActivity : AppCompatActivity() {
+
+    // ==========================================
+    // DEEPSEEK / QWEN CLOUD CONFIGURATION
+    // ==========================================
+    private val DASHSCOPE_API_KEY = BuildConfig.DASHSCOPE_API_KEY
+    private val QWEN_ENDPOINT = "https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
+    private val VLM_MODEL = "deepseek-v4.1-flash"
+
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .build()
+
+    private val modalEndpoint = "https://emmanuelnwalema--mobile-6dof-capture-ui.modal.run/upload_plate"
 
     private lateinit var rootLayout: FrameLayout
     private lateinit var sceneView: ARSceneView
@@ -70,20 +82,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val httpClient = OkHttpClient()
-    private val modalEndpoint = "https://emmanuelnwalema--mobile-6dof-capture-ui.modal.run/upload_plate"
-
-    private var tfliteInterpreter: Interpreter? = null
-    private val modelAssetName = "yolov8n.tflite"
-    private val modelInputSize = 640
-
-    private val debugLog = StringBuilder("App Initialized\n")
+    private val debugLog = StringBuilder("App Initialized (Swift VLM Engine)\n")
     private var toneGen: ToneGenerator? = null
 
     private var currentStepIdx = 0
     private var isBoxPlaced = false
     private var isCapturing = false
     private var isBatchUploading = false
+    private var isVlmRunning = false
     private var lastFrame: Frame? = null
     private var prismAnchor: Anchor? = null
     private var initialAzimuth = 0f
@@ -157,8 +163,6 @@ class MainActivity : AppCompatActivity() {
             toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
         } catch (e: Exception) {}
 
-        initTFLite()
-
         overlayView = PrismOverlayView(this)
         rootLayout.addView(overlayView, 1)
 
@@ -201,12 +205,11 @@ class MainActivity : AppCompatActivity() {
         btnScaleUp.setOnClickListener { scalePrism(1.08f) }
         btnScaleDown.setOnClickListener { scalePrism(0.92f) }
 
-        // Tap HUD indicators to view real-time logs
         scaleReadout.setOnClickListener { showDebugDialog() }
         valScale.setOnClickListener { showDebugDialog() }
         targetBadge.setOnClickListener { showDebugDialog() }
 
-        // Long press scale readout to instantly rotate box 90° for ambiguous square/circular items
+        // Long-press scale text to rotate cage 90 degrees if needed
         scaleReadout.setOnLongClickListener {
             val temp = prismWidth
             prismWidth = prismDepth
@@ -239,36 +242,12 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("Rig TFLite Diagnostics")
+                .setTitle("VLM Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
                 .show()
         }
-    }
-
-    private fun initTFLite() {
-        Thread {
-            try {
-                logDebug("Loading asset: $modelAssetName")
-                val fd: AssetFileDescriptor = assets.openFd(modelAssetName)
-                val inputStream = FileInputStream(fd.fileDescriptor)
-                val fileChannel = inputStream.channel
-                val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-
-                val options = Interpreter.Options().apply {
-                    setNumThreads(4)
-                }
-                val interp = Interpreter(modelBuffer, options)
-                tfliteInterpreter = interp
-
-                val inShape = interp.getInputTensor(0).shape()
-                val outShape = interp.getOutputTensor(0).shape()
-                logDebug("✓ COCO Model Ready!\nIn: ${inShape.contentToString()}\nOut: ${outShape.contentToString()}")
-            } catch (e: Exception) {
-                logDebug("❌ Model Load Failed: ${e.javaClass.simpleName}: ${e.message}")
-            }
-        }.start()
     }
 
     private fun buildThumbnailStrip() {
@@ -386,7 +365,7 @@ class MainActivity : AppCompatActivity() {
             Matrix.multiplyMM(vpMat, 0, pMat, 0, vMat, 0)
             Matrix.invertM(invVpMat, 0, vpMat, 0)
 
-            runOnDeviceCocoPipeline(invVpMat, anchor, camAngle, frame)
+            runCloudVlmPipeline(invVpMat, anchor, camAngle, frame)
 
             actionButton.visibility = View.GONE
             scaleBar.visibility = View.VISIBLE
@@ -406,16 +385,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    data class DetectionBox(
-        val leftPx: Float,
-        val topPx: Float,
-        val rightPx: Float,
-        val bottomPx: Float,
-        val confidence: Float,
-        val classId: Int
-    )
-
-    private fun runOnDeviceCocoPipeline(
+    private fun runCloudVlmPipeline(
         invVpMatrix: FloatArray,
         anchor: Anchor,
         camAngle: Float,
@@ -423,7 +393,11 @@ class MainActivity : AppCompatActivity() {
     ) {
         val sWidth = sceneView.width
         val sHeight = sceneView.height
-        if (sWidth <= 0 || sHeight <= 0) return
+        if (sWidth <= 0 || sHeight <= 0 || isVlmRunning) return
+
+        isVlmRunning = true
+        distIndicator.text = "AI REASONING (DeepSeek v4.1)..."
+        distIndicator.setTextColor(Color.parseColor("#E3B341"))
 
         val bitmap = Bitmap.createBitmap(sWidth, sHeight, Bitmap.Config.ARGB_8888)
         PixelCopy.request(
@@ -432,151 +406,25 @@ class MainActivity : AppCompatActivity() {
             { copyResult ->
                 if (copyResult == PixelCopy.SUCCESS) {
                     Thread {
-                        val interpreter = tfliteInterpreter
-                        if (interpreter != null) {
-                            val box = runCocoInference(bitmap, interpreter)
-                            if (box != null) {
-                                projectCocoBoxAndOrient(bitmap, box, invVpMatrix, anchor, camAngle, frame, sWidth, sHeight)
-                                return@Thread
-                            }
-                        }
+                        callDeepSeekVlm(bitmap, invVpMatrix, anchor, camAngle, frame, sWidth, sHeight)
                     }.start()
+                } else {
+                    isVlmRunning = false
                 }
             },
             Handler(Looper.getMainLooper())
         )
     }
 
-    private fun runCocoInference(bitmap: Bitmap, interpreter: Interpreter): DetectionBox? {
-        try {
-            logDebug("Running aspect-corrected inference on ${bitmap.width}x${bitmap.height} frame...")
-
-            // 1. Aspect-Preserving 1:1 Center Crop: Eliminates non-uniform vertical compression
-            val minDim = min(bitmap.width, bitmap.height)
-            val cropX = (bitmap.width - minDim) / 2f
-            val cropY = (bitmap.height - minDim) / 2f
-            val squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
-            val scaledBmp = Bitmap.createScaledBitmap(squareBmp, modelInputSize, modelInputSize, true)
-
-            val inputBuffer = ByteBuffer.allocateDirect(1 * modelInputSize * modelInputSize * 3 * 4).apply {
-                order(ByteOrder.nativeOrder())
-            }
-
-            val intValues = IntArray(modelInputSize * modelInputSize)
-            scaledBmp.getPixels(intValues, 0, modelInputSize, 0, 0, modelInputSize, modelInputSize)
-
-            var pixel = 0
-            for (i in 0 until modelInputSize) {
-                for (j in 0 until modelInputSize) {
-                    val value = intValues[pixel++]
-                    inputBuffer.putFloat(((value shr 16 and 0xFF) / 255.0f))
-                    inputBuffer.putFloat(((value shr 8 and 0xFF) / 255.0f))
-                    inputBuffer.putFloat(((value and 0xFF) / 255.0f))
-                }
-            }
-
-            val outputShape = interpreter.getOutputTensor(0).shape()
-            val dim1 = outputShape[1]
-            val dim2 = outputShape[2]
-            val isChannelsFirst = dim1 < dim2
-            val channels = if (isChannelsFirst) dim1 else dim2
-            val numBoxes = if (isChannelsFirst) dim2 else dim1
-
-            logDebug("COCO Out: ${outputShape.contentToString()} | Channels: $channels, Boxes: $numBoxes")
-
-            val outputBuffer = if (isChannelsFirst) {
-                Array(1) { Array(channels) { FloatArray(numBoxes) } }
-            } else {
-                Array(1) { Array(numBoxes) { FloatArray(channels) } }
-            }
-
-            interpreter.run(inputBuffer, outputBuffer)
-
-            var bestBox: DetectionBox? = null
-            var highestScore = 0f
-            val screenCenterX = bitmap.width / 2f
-            val screenCenterY = bitmap.height / 2f
-
-            for (i in 0 until numBoxes) {
-                val cxNorm: Float; val cyNorm: Float; val wNorm: Float; val hNorm: Float
-                var maxClass = 0f
-                var bestClassIdx = 0
-
-                if (isChannelsFirst) {
-                    @Suppress("UNCHECKED_CAST")
-                    val buf = outputBuffer as Array<Array<FloatArray>>
-                    cxNorm = buf[0][0][i] / modelInputSize
-                    cyNorm = buf[0][1][i] / modelInputSize
-                    wNorm = buf[0][2][i] / modelInputSize
-                    hNorm = buf[0][3][i] / modelInputSize
-                    for (c in 4 until channels) {
-                        val score = buf[0][c][i]
-                        if (score > maxClass) {
-                            maxClass = score
-                            bestClassIdx = c - 4
-                        }
-                    }
-                } else {
-                    @Suppress("UNCHECKED_CAST")
-                    val buf = outputBuffer as Array<Array<FloatArray>>
-                    cxNorm = buf[0][i][0] / modelInputSize
-                    cyNorm = buf[0][i][1] / modelInputSize
-                    wNorm = buf[0][i][2] / modelInputSize
-                    hNorm = buf[0][i][3] / modelInputSize
-                    for (c in 4 until channels) {
-                        val score = buf[0][i][c]
-                        if (score > maxClass) {
-                            maxClass = score
-                            bestClassIdx = c - 4
-                        }
-                    }
-                }
-
-                if (maxClass > highestScore) highestScore = maxClass
-
-                // Map square coordinates back to full camera viewport space
-                val boxWPx = wNorm * minDim
-                val boxHPx = hNorm * minDim
-                val boxCXPx = cropX + cxNorm * minDim
-                val boxCYPx = cropY + cyNorm * minDim
-
-                if (maxClass > 0.25f) {
-                    val distNorm = sqrt(
-                        ((boxCXPx - screenCenterX) / minDim).pow(2) +
-                        ((boxCYPx - screenCenterY) / minDim).pow(2)
-                    )
-                    if (distNorm < 0.45f) {
-                        val l = (boxCXPx - boxWPx / 2f).coerceIn(0f, bitmap.width.toFloat() - 1f)
-                        val t = (boxCYPx - boxHPx / 2f).coerceIn(0f, bitmap.height.toFloat() - 1f)
-                        val r = (boxCXPx + boxWPx / 2f).coerceIn(l + 8f, bitmap.width.toFloat())
-                        val b = (boxCYPx + boxHPx / 2f).coerceIn(t + 8f, bitmap.height.toFloat())
-                        bestBox = DetectionBox(l, t, r, b, maxClass, bestClassIdx)
-                    }
-                }
-            }
-
-            logDebug("COCO Max Score: ${String.format(Locale.US, "%.3f", highestScore)}")
-            if (bestBox == null) {
-                logDebug("⚠️ No object detected above 0.25 threshold")
-                showDebugDialog()
-            } else {
-                logDebug("✓ Detected class ${bestBox.classId} with conf ${String.format(Locale.US, "%.2f", bestBox.confidence)}")
-            }
-            return bestBox
-        } catch (e: Exception) {
-            logDebug("❌ Inference Exception: ${e.javaClass.simpleName}: ${e.message}")
-            showDebugDialog()
-            return null
-        }
-    }
-
     /**
-     * Universal 3D Table-Plane Fitting, Center Re-Anchoring & Alignment.
-     * Prevents bounding box drift when orbiting behind the object.
+     * Swift, low-latency call to DeepSeek v4.1 Flash:
+     * - Uses greedy decoding (temperature: 0.0)
+     * - Caps tokens at 120
+     * - Enforces json_object grammar
+     * - Scales to 448px @ 75% JPEG
      */
-    private fun projectCocoBoxAndOrient(
-        fullBmp: Bitmap,
-        box: DetectionBox,
+    private fun callDeepSeekVlm(
+        bitmap: Bitmap,
         invVpMatrix: FloatArray,
         anchor: Anchor,
         camAngle: Float,
@@ -584,220 +432,175 @@ class MainActivity : AppCompatActivity() {
         sWidth: Int,
         sHeight: Int
     ) {
+        try {
+            val minDim = min(bitmap.width, bitmap.height)
+            val cropX = (bitmap.width - minDim) / 2f
+            val cropY = (bitmap.height - minDim) / 2f
+            val squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
+            val vlmBmp = Bitmap.createScaledBitmap(squareBmp, 448, 448, true)
+
+            val stream = ByteArrayOutputStream()
+            vlmBmp.compress(Bitmap.CompressFormat.JPEG, 75, stream)
+            val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+
+            logDebug("Sending swift ${stream.size() / 1024} KB payload to $VLM_MODEL...")
+
+            val systemPrompt = """
+                Detect primary object on table. Return raw JSON only. Do not think, explain, or use markdown.
+                Format:
+                {"category":"name","box_2d":[ymin,xmin,ymax,xmax],"heading_deg":0,"approx_height_cm":4.0}
+                Coordinates are normalized 0.0-1.0. heading_deg: 0=facing camera, 90=right, 180=away, 270=left.
+            """.trimIndent()
+
+            val contentArray = JSONArray().apply {
+                put(JSONObject().apply {
+                    put("type", "image_url")
+                    put("image_url", JSONObject().apply {
+                        put("url", "data:image/jpeg;base64,$b64")
+                    })
+                })
+                put(JSONObject().apply {
+                    put("type", "text")
+                    put("text", systemPrompt)
+                })
+            }
+
+            val requestBodyJson = JSONObject().apply {
+                put("model", VLM_MODEL)
+                put("messages", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("role", "user")
+                        put("content", contentArray)
+                    })
+                })
+                put("temperature", 0.0)
+                put("max_tokens", 120)
+                put("response_format", JSONObject().apply {
+                    put("type", "json_object")
+                })
+            }
+
+            val request = Request.Builder()
+                .url(QWEN_ENDPOINT)
+                .addHeader("Authorization", "Bearer $DASHSCOPE_API_KEY")
+                .addHeader("Content-Type", "application/json")
+                .post(requestBodyJson.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val startTime = System.currentTimeMillis()
+            val response = httpClient.newCall(request).execute()
+            val respStr = response.body?.string().orEmpty()
+            val durationMs = System.currentTimeMillis() - startTime
+            response.close()
+
+            logDebug("VLM latency: ${durationMs}ms | Resp: ${respStr.length} chars")
+
+            val rootJson = JSONObject(respStr)
+            val choices = rootJson.getJSONArray("choices")
+            val message = choices.getJSONObject(0).getJSONObject("message")
+            var rawContent = message.getString("content").trim()
+
+            if (rawContent.startsWith("```json")) rawContent = rawContent.removePrefix("```json")
+            if (rawContent.startsWith("```")) rawContent = rawContent.removePrefix("```")
+            if (rawContent.endsWith("```")) rawContent = rawContent.removeSuffix("```")
+            rawContent = rawContent.trim()
+
+            val resultJson = JSONObject(rawContent)
+            val category = resultJson.optString("category", "object")
+            val headingDeg = resultJson.optDouble("heading_deg", 0.0).toFloat()
+            val heightCm = resultJson.optDouble("approx_height_cm", 4.0).toFloat()
+
+            val boxArray = resultJson.getJSONArray("box_2d")
+            val ymin = boxArray.getDouble(0).toFloat()
+            val xmin = boxArray.getDouble(1).toFloat()
+            val ymax = boxArray.getDouble(2).toFloat()
+            val xmax = boxArray.getDouble(3).toFloat()
+
+            val screenLeft = cropX + xmin * minDim
+            val screenRight = cropX + xmax * minDim
+            val screenTop = cropY + ymin * minDim
+            val screenBottom = cropY + ymax * minDim
+            val screenCX = (screenLeft + screenRight) / 2f
+            val screenCY = (screenTop + screenBottom) / 2f
+
+            logDebug("✓ $category (${durationMs}ms) | Heading: ${headingDeg}°")
+
+            projectVlmDetectionsToGround(
+                screenCX, screenCY, screenLeft, screenTop, screenRight, screenBottom,
+                headingDeg, heightCm, category, invVpMatrix, anchor, camAngle, frame, sWidth, sHeight
+            )
+
+        } catch (e: Exception) {
+            logDebug("❌ VLM Inference Failed: ${e.javaClass.simpleName}: ${e.message}")
+            showDebugDialog()
+        } finally {
+            isVlmRunning = false
+        }
+    }
+
+    private fun projectVlmDetectionsToGround(
+        screenCX: Float, screenCY: Float,
+        sLeft: Float, sTop: Float, sRight: Float, sBottom: Float,
+        headingDeg: Float, heightCm: Float, category: String,
+        invVpMatrix: FloatArray, anchor: Anchor,
+        camAngle: Float, frame: Frame, sWidth: Int, sHeight: Int
+    ) {
         val anchorPose = anchor.pose
         val invAnchor = anchorPose.inverse()
         val planeY = anchorPose.ty()
 
-        val leftPx = box.leftPx.toInt().coerceIn(0, sWidth - 1)
-        val topPx = box.topPx.toInt().coerceIn(0, sHeight - 1)
-        val rightPx = box.rightPx.toInt().coerceIn(leftPx + 8, sWidth)
-        val botPx = box.bottomPx.toInt().coerceIn(topPx + 8, sHeight)
-        val cropW = rightPx - leftPx
-        val cropH = botPx - topPx
-
-        // 1. Isolate the object contour strictly INSIDE the detected YOLO crop
-        val cropBmp = Bitmap.createBitmap(fullBmp, leftPx, topPx, cropW, cropH)
-
-        val cTL = cropBmp.getPixel(2, 2)
-        val cTR = cropBmp.getPixel(cropW - 3, 2)
-        val cBL = cropBmp.getPixel(2, cropH - 3)
-        val cBR = cropBmp.getPixel(cropW - 3, cropH - 3)
-        val bgR = (Color.red(cTL) + Color.red(cTR) + Color.red(cBL) + Color.red(cBR)) / 4
-        val bgG = (Color.green(cTL) + Color.green(cTR) + Color.green(cBL) + Color.green(cBR)) / 4
-        val bgB = (Color.blue(cTL) + Color.blue(cTR) + Color.blue(cBL) + Color.blue(cBR)) / 4
-
-        var sumX = 0.0; var sumY = 0.0; var count = 0
-        val fgX = mutableListOf<Int>()
-        val fgY = mutableListOf<Int>()
-
-        for (y in 2 until cropH - 2 step 3) {
-            for (x in 2 until cropW - 2 step 3) {
-                val px = cropBmp.getPixel(x, y)
-                val diff = sqrt(
-                    ((Color.red(px) - bgR) * (Color.red(px) - bgR) +
-                     (Color.green(px) - bgG) * (Color.green(px) - bgG) +
-                     (Color.blue(px) - bgB) * (Color.blue(px) - bgB)).toDouble()
-                )
-                if (diff > 25.0) {
-                    sumX += x; sumY += y
-                    fgX.add(x); fgY.add(y)
-                    count++
-                }
-            }
-        }
-
-        val barX = if (count > 20) (sumX / count).toFloat() else cropW / 2f
-        val barY = if (count > 20) (sumY / count).toFloat() else cropH / 2f
-
-        var theta2D = if (cropH > cropW) (Math.PI / 2.0).toFloat() else 0f
-        if (count > 30) {
-            var mu20 = 0.0; var mu02 = 0.0; var mu11 = 0.0
-            for (i in 0 until count) {
-                val dx = fgX[i] - barX
-                val dy = fgY[i] - barY
-                mu20 += dx * dx
-                mu02 += dy * dy
-                mu11 += dx * dy
-            }
-            theta2D = (0.5 * atan2(2.0 * mu11, mu20 - mu02)).toFloat()
-        }
-
-        val cosT = cos(theta2D)
-        val sinT = sin(theta2D)
-        val uX = cosT; val uY = sinT
-        val vX = -sinT; val vY = cosT
-
-        var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
-        var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
-
-        if (count > 30) {
-            for (i in 0 until count) {
-                val dx = fgX[i] - barX
-                val dy = fgY[i] - barY
-                val pu = dx * uX + dy * uY
-                val pv = dx * vX + dy * vY
-                minU = min(minU, pu); maxU = max(maxU, pu)
-                minV = min(minV, pv); maxV = max(maxV, pv)
-            }
-        } else {
-            minU = -cropW * 0.45f; maxU = cropW * 0.45f
-            minV = -cropH * 0.45f; maxV = cropH * 0.45f
-        }
-
-        val halfSpan1Px = (maxU - minU) * 0.5f
-        val halfSpan2Px = (maxV - minV) * 0.5f
-
-        val screenCX = leftPx + barX
-        val screenCY = topPx + barY
-
-        // 2. Unproject the two orthogonal axes down to the horizontal table plane
         val pCenterWorld = intersectScreenRayWithHorizontalPlane(screenCX, screenCY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p1AWorld = intersectScreenRayWithHorizontalPlane(screenCX + halfSpan1Px * uX, screenCY + halfSpan1Px * uY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p1BWorld = intersectScreenRayWithHorizontalPlane(screenCX - halfSpan1Px * uX, screenCY - halfSpan1Px * uY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p2AWorld = intersectScreenRayWithHorizontalPlane(screenCX + halfSpan2Px * vX, screenCY + halfSpan2Px * vY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p2BWorld = intersectScreenRayWithHorizontalPlane(screenCX - halfSpan2Px * vX, screenCY - halfSpan2Px * vY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
+        val pTopMid = intersectScreenRayWithHorizontalPlane(screenCX, sTop, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
+        val pBotMid = intersectScreenRayWithHorizontalPlane(screenCX, sBottom, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
+        val pLeftMid = intersectScreenRayWithHorizontalPlane(sLeft, screenCY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
+        val pRightMid = intersectScreenRayWithHorizontalPlane(sRight, screenCY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
 
-        if (pCenterWorld == null || p1AWorld == null || p1BWorld == null || p2AWorld == null || p2BWorld == null) {
-            logDebug("Plane ray projection outside valid bounds")
+        if (pCenterWorld == null || pTopMid == null || pBotMid == null || pLeftMid == null || pRightMid == null) {
+            logDebug("Ground projection fell outside boundary planes")
             return
         }
 
-        val l1A = invAnchor.transformPoint(p1AWorld)
-        val l1B = invAnchor.transformPoint(p1BWorld)
-        val l2A = invAnchor.transformPoint(p2AWorld)
-        val l2B = invAnchor.transformPoint(p2BWorld)
+        val lTop = invAnchor.transformPoint(pTopMid)
+        val lBot = invAnchor.transformPoint(pBotMid)
+        val lLeft = invAnchor.transformPoint(pLeftMid)
+        val lRight = invAnchor.transformPoint(pRightMid)
 
-        // 3. Compute true physical metric spans and unit vectors on the table surface
-        val v1X = l1A[0] - l1B[0]
-        val v1Z = l1A[2] - l1B[2]
-        val span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceAtLeast(0.04f)
-        val u1X = v1X / span1
-        val u1Z = v1Z / span1
+        val spanLong = sqrt((lTop[0] - lBot[0]).pow(2) + (lTop[2] - lBot[2]).pow(2)).coerceIn(0.04f, 0.50f)
+        val spanLat = sqrt((lLeft[0] - lRight[0]).pow(2) + (lLeft[2] - lRight[2]).pow(2)).coerceIn(0.04f, 0.50f)
 
-        val v2X = l2A[0] - l2B[0]
-        val v2Z = l2A[2] - l2B[2]
-        val span2 = sqrt(v2X * v2X + v2Z * v2Z).coerceAtLeast(0.04f)
-        val u2X = v2X / span2
-        val u2Z = v2Z / span2
-
-        // 4. Universal Canonical Normal Selection: Selects closest camera-facing normal
-        val camDirX = sin(camAngle)
-        val camDirZ = cos(camAngle)
-
-        val dot0 = u1X * camDirX + u1Z * camDirZ
-        val dot1 = -dot0
-        val dot2 = u2X * camDirX + u2Z * camDirZ
-        val dot3 = -dot2
-
-        val dots = floatArrayOf(dot0, dot1, dot2, dot3)
-        var bestIdx = 0
-        var maxDot = -Float.MAX_VALUE
-        for (i in 0 until 4) {
-            if (dots[i] > maxDot) {
-                maxDot = dots[i]
-                bestIdx = i
-            }
-        }
-
-        val margin = 1.10f
-        val finalWidth: Float
+        val isLongitudinal = (headingDeg in 315f..360f) || (headingDeg in 0f..45f) || (headingDeg in 135f..225f)
         val finalDepth: Float
-        val headingAngle: Float
+        val finalWidth: Float
 
-        when (bestIdx) {
-            0 -> {
-                finalDepth = (span1 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                finalWidth = (span2 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                headingAngle = atan2(u1X, u1Z)
-            }
-            1 -> {
-                finalDepth = (span1 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                finalWidth = (span2 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                headingAngle = atan2(-u1X, -u1Z)
-            }
-            2 -> {
-                finalDepth = (span2 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                finalWidth = (span1 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                headingAngle = atan2(u2X, u2Z)
-            }
-            else -> {
-                finalDepth = (span2 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                finalWidth = (span1 * margin + 0.012f).coerceIn(0.04f, 0.50f)
-                headingAngle = atan2(-u2X, -u2Z)
-            }
+        if (isLongitudinal) {
+            finalDepth = max(spanLong, spanLat) * 1.08f
+            finalWidth = min(spanLong, spanLat) * 1.08f
+        } else {
+            finalDepth = min(spanLong, spanLat) * 1.08f
+            finalWidth = max(spanLong, spanLat) * 1.08f
         }
 
-        // 5. Vertical height dimensioning via elevated point cloud
-        var measuredHeight = 0f
-        try {
-            val pc = frame.acquirePointCloud()
-            val pBuf = pc.points
-            val pCount = pBuf.remaining() / 4
-            var maxY = 0f
-            var validPts = 0
-            val maxBoundR = max(finalWidth, finalDepth) * 0.75f
-
-            for (p in 0 until pCount) {
-                val conf = pBuf.get(p * 4 + 3)
-                if (conf < 0.20f) continue
-                val pw = invAnchor.transformPoint(floatArrayOf(pBuf.get(p * 4), pBuf.get(p * 4 + 1), pBuf.get(p * 4 + 2)))
-                val distH = sqrt(pw[0] * pw[0] + pw[2] * pw[2])
-                if (pw[1] in 0.006f..0.45f && distH <= maxBoundR) {
-                    maxY = max(maxY, pw[1])
-                    validPts++
-                }
-            }
-            pc.close()
-            if (validPts >= 3 && maxY > 0.010f) {
-                measuredHeight = (maxY * 1.15f + 0.01f).coerceIn(0.02f, 0.40f)
-            }
-        } catch (e: Exception) {}
-
-        if (measuredHeight <= 0.01f) {
-            measuredHeight = (min(finalWidth, finalDepth) * 0.42f).coerceIn(0.025f, 0.15f)
-        }
+        val finalAzimuth = camAngle + Math.toRadians(headingDeg.toDouble()).toFloat()
+        val finalHeight = (heightCm / 100f).coerceIn(0.02f, 0.35f)
 
         runOnUiThread {
-            // 6. Center Re-Anchoring: Pin anchor directly to the physical 3D center of the object
+            // Re-anchor to physical 3D object center to prevent drift on orbit
             try {
                 val session = sceneView.session
                 if (session != null) {
                     prismAnchor?.detach()
-                    val oldRot = anchorPose.rotationQuaternion
                     val newCenterPose = Pose(
                         floatArrayOf(pCenterWorld[0], planeY, pCenterWorld[2]),
-                        oldRot
+                        anchorPose.rotationQuaternion
                     )
                     prismAnchor = session.createAnchor(newCenterPose)
                 }
-            } catch (e: Exception) {
-                logDebug("Re-anchor failed: ${e.message}")
-            }
+            } catch (e: Exception) {}
 
-            initialAzimuth = headingAngle
+            initialAzimuth = finalAzimuth
             prismWidth = finalWidth
             prismDepth = finalDepth
-            prismHeight = measuredHeight
+            prismHeight = finalHeight
 
             updateScaleLabels()
             overlayView.postInvalidate()
@@ -805,11 +608,11 @@ class MainActivity : AppCompatActivity() {
             val wCm = (prismWidth * 100).roundToInt()
             val dCm = (prismDepth * 100).roundToInt()
             val hCm = (prismHeight * 100).roundToInt()
-            val yawDeg = Math.toDegrees(headingAngle.toDouble()).roundToInt()
-            logDebug("✓ Re-anchored to Center: ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
+
+            logDebug("✓ AI Locked: $category (${wCm}×${dCm}×${hCm}cm) | Heading: ${headingDeg}°")
             Toast.makeText(
                 this@MainActivity,
-                "✓ Locked & Centered: ${wCm}×${dCm}×${hCm}cm | Heading: ${yawDeg}°",
+                "✓ DeepSeek: $category [${wCm}×${dCm}×${hCm}cm] ${headingDeg}°",
                 Toast.LENGTH_SHORT
             ).show()
         }
