@@ -50,10 +50,10 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.8.2")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 
-    // Direct standalone string for the working Sceneview version
-    implementation("io.github.sceneview:arsceneview:0.9.8")
+    // Uses the exact version catalog dependency that worked in AssetCaptureRig
+    implementation(libs.arsceneview)
 
-    // Networking
+    // Networking for DeepSeek VLM
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     testImplementation("junit:junit:4.13.2")
