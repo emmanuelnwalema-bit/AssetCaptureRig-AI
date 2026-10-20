@@ -11,6 +11,7 @@ import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import android.view.PixelCopy
+import android.view.SurfaceView
 import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
@@ -209,7 +210,6 @@ class MainActivity : AppCompatActivity() {
         valScale.setOnClickListener { showDebugDialog() }
         targetBadge.setOnClickListener { showDebugDialog() }
 
-        // Long-press scale text to rotate cage 90 degrees if needed
         scaleReadout.setOnLongClickListener {
             val temp = prismWidth
             prismWidth = prismDepth
@@ -401,9 +401,9 @@ class MainActivity : AppCompatActivity() {
 
         val bitmap = Bitmap.createBitmap(sWidth, sHeight, Bitmap.Config.ARGB_8888)
         PixelCopy.request(
-            sceneView,
+            sceneView as SurfaceView,
             bitmap,
-            { copyResult ->
+            PixelCopy.OnPixelCopyFinishedListener { copyResult: Int ->
                 if (copyResult == PixelCopy.SUCCESS) {
                     Thread {
                         callDeepSeekVlm(bitmap, invVpMatrix, anchor, camAngle, frame, sWidth, sHeight)
@@ -416,13 +416,6 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * Swift, low-latency call to DeepSeek v4.1 Flash:
-     * - Uses greedy decoding (temperature: 0.0)
-     * - Caps tokens at 120
-     * - Enforces json_object grammar
-     * - Scales to 448px @ 75% JPEG
-     */
     private fun callDeepSeekVlm(
         bitmap: Bitmap,
         invVpMatrix: FloatArray,
@@ -584,7 +577,6 @@ class MainActivity : AppCompatActivity() {
         val finalHeight = (heightCm / 100f).coerceIn(0.02f, 0.35f)
 
         runOnUiThread {
-            // Re-anchor to physical 3D object center to prevent drift on orbit
             try {
                 val session = sceneView.session
                 if (session != null) {
@@ -792,9 +784,9 @@ class MainActivity : AppCompatActivity() {
 
         val bitmap = Bitmap.createBitmap(sceneView.width, sceneView.height, Bitmap.Config.ARGB_8888)
         PixelCopy.request(
-            sceneView,
+            sceneView as SurfaceView,
             bitmap,
-            { copyResult ->
+            PixelCopy.OnPixelCopyFinishedListener { copyResult: Int ->
                 if (copyResult == PixelCopy.SUCCESS) {
                     Thread {
                         try {
