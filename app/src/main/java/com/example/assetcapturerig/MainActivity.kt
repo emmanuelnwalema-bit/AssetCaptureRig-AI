@@ -44,9 +44,9 @@ class MainActivity : AppCompatActivity() {
     private val VLM_MODEL = "deepseek-v4.1-flash"
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
     private val modalEndpoint = "https://emmanuelnwalema--mobile-6dof-capture-ui.modal.run/upload_plate"
@@ -416,6 +416,10 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    /**
+     * Disables hybrid thinking mode ("enable_thinking": false) so DeepSeek outputs
+     * directly to "content" without burning tokens in "reasoning_content".
+     */
     private fun callDeepSeekVlm(
         bitmap: Bitmap,
         invVpMatrix: FloatArray,
@@ -439,10 +443,10 @@ class MainActivity : AppCompatActivity() {
             logDebug("Sending swift ${stream.size() / 1024} KB payload to $VLM_MODEL...")
 
             val systemPrompt = """
-                Detect primary object on table. Return raw JSON only. Do not think, explain, or use markdown.
-                Format:
+                /no_think
+                Detect the primary object on the table. Output raw JSON only with no explanation:
                 {"category":"name","box_2d":[ymin,xmin,ymax,xmax],"heading_deg":0,"approx_height_cm":4.0}
-                Coordinates are normalized 0.0-1.0. heading_deg: 0=facing camera, 90=right, 180=away, 270=left.
+                Note: box_2d uses normalized floats 0.0 to 1.0. heading_deg is 0 (facing camera), 90 (right), 180 (away), or 270 (left).
             """.trimIndent()
 
             val contentArray = JSONArray().apply {
@@ -466,11 +470,10 @@ class MainActivity : AppCompatActivity() {
                         put("content", contentArray)
                     })
                 })
+                // Explicitly disable QwenCloud / DeepSeek chain-of-thought thinking mode
+                put("enable_thinking", false)
                 put("temperature", 0.0)
-                put("max_tokens", 120)
-                put("response_format", JSONObject().apply {
-                    put("type", "json_object")
-                })
+                put("max_tokens", 600)
             }
 
             val request = Request.Builder()
@@ -486,28 +489,56 @@ class MainActivity : AppCompatActivity() {
             val durationMs = System.currentTimeMillis() - startTime
             response.close()
 
-            logDebug("VLM latency: ${durationMs}ms | Resp: ${respStr.length} chars")
+            logDebug("VLM latency: ${durationMs}ms | HTTP ${response.code} | Resp: ${respStr.length} chars")
 
             val rootJson = JSONObject(respStr)
+            if (rootJson.has("error")) {
+                val errMsg = rootJson.getJSONObject("error").optString("message", respStr)
+                logDebug("❌ API Error: $errMsg")
+                showDebugDialog()
+                return
+            }
+
             val choices = rootJson.getJSONArray("choices")
             val message = choices.getJSONObject(0).getJSONObject("message")
-            var rawContent = message.getString("content").trim()
 
-            if (rawContent.startsWith("```json")) rawContent = rawContent.removePrefix("```json")
-            if (rawContent.startsWith("```")) rawContent = rawContent.removePrefix("```")
-            if (rawContent.endsWith("```")) rawContent = rawContent.removeSuffix("```")
-            rawContent = rawContent.trim()
+            var rawContent = message.optString("content", "").trim()
+            if (rawContent.isEmpty() || rawContent == "null") {
+                rawContent = message.optString("reasoning_content", "").trim()
+            }
 
-            val resultJson = JSONObject(rawContent)
+            // Extract the JSON object {...} cleanly from the model output
+            val startBrace = rawContent.indexOf('{')
+            val endBrace = rawContent.lastIndexOf('}')
+            if (startBrace == -1 || endBrace <= startBrace) {
+                logDebug("❌ Unparseable output: $rawContent")
+                showDebugDialog()
+                return
+            }
+            val cleanJsonStr = rawContent.substring(startBrace, endBrace + 1)
+
+            val resultJson = JSONObject(cleanJsonStr)
             val category = resultJson.optString("category", "object")
             val headingDeg = resultJson.optDouble("heading_deg", 0.0).toFloat()
             val heightCm = resultJson.optDouble("approx_height_cm", 4.0).toFloat()
 
             val boxArray = resultJson.getJSONArray("box_2d")
-            val ymin = boxArray.getDouble(0).toFloat()
-            val xmin = boxArray.getDouble(1).toFloat()
-            val ymax = boxArray.getDouble(2).toFloat()
-            val xmax = boxArray.getDouble(3).toFloat()
+            val v0 = boxArray.getDouble(0).toFloat()
+            val v1 = boxArray.getDouble(1).toFloat()
+            val v2 = boxArray.getDouble(2).toFloat()
+            val v3 = boxArray.getDouble(3).toFloat()
+
+            // Normalize automatically if model returns 0..1000 or pixel scale instead of 0..1
+            val scaleDiv = if (max(max(v0, v1), max(v2, v3)) > 1.5f) {
+                if (max(max(v0, v1), max(v2, v3)) > 450f) 1000f else 448f
+            } else {
+                1f
+            }
+
+            val ymin = (v0 / scaleDiv).coerceIn(0.05f, 0.95f)
+            val xmin = (v1 / scaleDiv).coerceIn(0.05f, 0.95f)
+            val ymax = (v2 / scaleDiv).coerceIn(ymin + 0.05f, 0.98f)
+            val xmax = (v3 / scaleDiv).coerceIn(xmin + 0.05f, 0.98f)
 
             val screenLeft = cropX + xmin * minDim
             val screenRight = cropX + xmax * minDim
@@ -516,7 +547,7 @@ class MainActivity : AppCompatActivity() {
             val screenCX = (screenLeft + screenRight) / 2f
             val screenCY = (screenTop + screenBottom) / 2f
 
-            logDebug("✓ $category (${durationMs}ms) | Heading: ${headingDeg}°")
+            logDebug("✓ $category (${durationMs}ms) | Box: [${xmin}, ${ymin}, ${xmax}, ${ymax}] | Heading: ${headingDeg}°")
 
             projectVlmDetectionsToGround(
                 screenCX, screenCY, screenLeft, screenTop, screenRight, screenBottom,
