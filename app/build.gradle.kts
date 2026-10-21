@@ -19,6 +19,11 @@ android {
         // Injects repository secret into BuildConfig
         val apiKey = System.getenv("DASHSCOPE_API_KEY") ?: ""
         buildConfigField("String", "DASHSCOPE_API_KEY", "\"$apiKey\"")
+
+        // Excludes emulator binaries to keep build fast and light
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
@@ -29,17 +34,41 @@ android {
                 "proguard-rules.pro"
             )
         }
+        debug {
+            isDebuggable = true
+        }
     }
+
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
+
     kotlinOptions {
-        jvmTarget = "11"
+        jvmTarget = "17"
     }
+
     buildFeatures {
         viewBinding = true
         buildConfig = true
+    }
+
+    packaging {
+        resources {
+            excludes += listOf(
+                "META-INF/INDEX.LIST",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE",
+                "META-INF/LICENSE.txt",
+                "META-INF/license.txt",
+                "META-INF/NOTICE",
+                "META-INF/NOTICE.txt",
+                "META-INF/notice.txt"
+            )
+        }
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
@@ -50,8 +79,9 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.8.2")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 
-    // Uses the exact version catalog dependency that worked in AssetCaptureRig
-    implementation(libs.arsceneview)
+    // Exact Sceneview & ARCore engine matching MainActivity.kt
+    implementation("com.google.ar:core:1.41.0")
+    implementation("io.github.sceneview:arsceneview:2.2.1")
 
     // Networking for DeepSeek VLM
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
