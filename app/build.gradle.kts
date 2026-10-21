@@ -16,11 +16,14 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Injects repository secret into BuildConfig
-        val apiKey = System.getenv("DASHSCOPE_API_KEY") ?: ""
+        // Strips any accidental newlines, quotes, or spaces from the GitHub Secret
+        val apiKey = (System.getenv("DASHSCOPE_API_KEY") ?: "")
+            .replace("\n", "")
+            .replace("\r", "")
+            .replace("\"", "")
+            .trim()
         buildConfigField("String", "DASHSCOPE_API_KEY", "\"$apiKey\"")
 
-        // Excludes emulator binaries to keep build fast and light
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
