@@ -19,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
+import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
 import okhttp3.*
@@ -82,7 +83,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (Stabilized VLM Engine)\n")
+    private val debugLog = StringBuilder("App Initialized (Direct 3D VLM Engine)\n")
     private var toneGen: ToneGenerator? = null
 
     private var currentStepIdx = 0
@@ -106,7 +107,7 @@ class MainActivity : AppCompatActivity() {
 
     private var prismWidth = 0.12f
     private var prismDepth = 0.12f
-    private var prismHeight = 0.06f
+    private var prismHeight = 0.05f
 
     private val capturedThumbnails = mutableMapOf<Int, Bitmap>()
     private val previewCardViews = mutableListOf<ImageView>()
@@ -349,10 +350,11 @@ class MainActivity : AppCompatActivity() {
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
         val hitResults = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
-        val firstHit = hitResults.firstOrNull()
+        // Prefer a tracked horizontal Plane hit so height is locked to the surface
+        val bestHit = hitResults.firstOrNull { it.trackable is Plane } ?: hitResults.firstOrNull()
 
-        if (firstHit != null) {
-            val anchor = firstHit.createAnchor()
+        if (bestHit != null) {
+            val anchor = bestHit.createAnchor()
             prismAnchor = anchor
 
             val anchorPose = anchor.pose
@@ -364,7 +366,6 @@ class MainActivity : AppCompatActivity() {
             isOriginInitialized = true
 
             val camPose = frame.camera.pose
-            // Compute camera azimuth in gravity-aligned world coordinates
             val camAngle = atan2(camPose.tx() - smoothOriginX, camPose.tz() - smoothOriginZ)
             initialAzimuth = camAngle
 
@@ -431,8 +432,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Queries DeepSeek-v4.1-Flash with explicit named bounding keys (xmin, ymin, xmax, ymax)
-     * so X and Y axes can never be transposed, plus real physical table dimensions.
+     * Requests the primary topmost object's 2D center, 2D centerline endpoints (end1 -> end2),
+     * and physical dimensions (length, width, thickness) in normalized 0.0..1.0 coordinates.
      */
     private fun callDeepSeekVlm(
         bitmap: Bitmap,
@@ -457,25 +458,31 @@ class MainActivity : AppCompatActivity() {
 
             val systemPrompt = """
                 /no_think
-                Locate the primary object resting on the surface. Output raw JSON only with no explanation:
+                Identify ONLY the single topmost foreground object near the center of the image (ignore any box, mat, or furniture underneath it).
+                Return raw JSON only with no explanation, using normalized floats strictly from 0.00 to 1.00:
                 {
                   "category": "object name",
-                  "xmin": 0.25,
-                  "ymin": 0.20,
-                  "xmax": 0.75,
-                  "ymax": 0.80,
-                  "angle_deg": 0,
-                  "length_cm": 15.0,
-                  "width_cm": 7.5,
-                  "thickness_cm": 1.5
+                  "center_x": 0.50,
+                  "center_y": 0.50,
+                  "xmin": 0.30,
+                  "ymin": 0.25,
+                  "xmax": 0.70,
+                  "ymax": 0.75,
+                  "end1_x": 0.35,
+                  "end1_y": 0.30,
+                  "end2_x": 0.65,
+                  "end2_y": 0.70,
+                  "length_cm": 15.5,
+                  "width_cm": 7.6,
+                  "thickness_cm": 1.2
                 }
-                Rules:
-                - xmin, xmax: horizontal left/right bounds (0.0 to 1.0 from left to right).
-                - ymin, ymax: vertical top/bottom bounds (0.0 to 1.0 from top to bottom).
-                - angle_deg: angle of the object's longest horizontal side on screen in degrees (-90 to 90), where 0 means the longest side runs vertically up-down on screen, 90 means it runs horizontally left-right across screen, and 45 means diagonal.
-                - length_cm: physical length of longest side on surface (cm).
-                - width_cm: physical width of shorter side on surface (cm).
-                - thickness_cm: vertical height rising up from the surface (cm, e.g. 1.0 for flat phone, 3.5 for earbuds/mouse).
+                Field definitions:
+                - center_x, center_y: exact 2D visual center of the topmost object (0.00=top/left, 1.00=bottom/right).
+                - xmin, ymin, xmax, ymax: tight 2D bounding box of the topmost object (0.00 to 1.00).
+                - (end1_x, end1_y) and (end2_x, end2_y): the two opposite ends of the object's longest centerline on screen (from one short side of the object to its opposite short side).
+                - length_cm: real physical length along that longest centerline in cm.
+                - width_cm: real physical width perpendicular to the centerline in cm.
+                - thickness_cm: vertical thickness rising off the surface in cm (e.g. 1.2 for phone case, 3.2 for earbuds case).
             """.trimIndent()
 
             val contentArray = JSONArray().apply {
@@ -546,38 +553,55 @@ class MainActivity : AppCompatActivity() {
             val resultJson = JSONObject(cleanJsonStr)
 
             val category = resultJson.optString("category", "object")
-            val vlmAngleDeg = resultJson.optDouble("angle_deg", 0.0).toFloat()
             val vlmLengthCm = resultJson.optDouble("length_cm", 12.0).toFloat()
-            val vlmWidthCm = resultJson.optDouble("width_cm", 8.0).toFloat()
-            val vlmThicknessCm = resultJson.optDouble("thickness_cm", 3.5).toFloat()
+            val vlmWidthCm = resultJson.optDouble("width_cm", 7.5).toFloat()
+            val vlmThicknessCm = resultJson.optDouble("thickness_cm", 3.0).toFloat()
 
-            var rawXmin = resultJson.optDouble("xmin", 0.25).toFloat()
-            var rawYmin = resultJson.optDouble("ymin", 0.25).toFloat()
-            var rawXmax = resultJson.optDouble("xmax", 0.75).toFloat()
-            var rawYmax = resultJson.optDouble("ymax", 0.75).toFloat()
+            val rawXmin = resultJson.optDouble("xmin", 0.25).toFloat()
+            val rawYmin = resultJson.optDouble("ymin", 0.25).toFloat()
+            val rawXmax = resultJson.optDouble("xmax", 0.75).toFloat()
+            val rawYmax = resultJson.optDouble("ymax", 0.75).toFloat()
 
             val maxCoord = max(max(rawXmin, rawYmin), max(rawXmax, rawYmax))
-            val scaleDiv = if (maxCoord > 1.5f) {
-                if (maxCoord > 450f) 1000f else 448f
-            } else {
-                1f
+            val scaleDiv = when {
+                maxCoord > 100f -> 1000f
+                maxCoord > 1.5f -> 100f
+                else -> 1f
             }
 
-            val xmin = (min(rawXmin, rawXmax) / scaleDiv).coerceIn(0.03f, 0.94f)
-            val xmax = (max(rawXmin, rawXmax) / scaleDiv).coerceIn(xmin + 0.05f, 0.98f)
-            val ymin = (min(rawYmin, rawYmax) / scaleDiv).coerceIn(0.03f, 0.94f)
-            val ymax = (max(rawYmin, rawYmax) / scaleDiv).coerceIn(ymin + 0.05f, 0.98f)
+            val xmin = (min(rawXmin, rawXmax) / scaleDiv).coerceIn(0.02f, 0.95f)
+            val xmax = (max(rawXmin, rawXmax) / scaleDiv).coerceIn(xmin + 0.04f, 0.98f)
+            val ymin = (min(rawYmin, rawYmax) / scaleDiv).coerceIn(0.02f, 0.95f)
+            val ymax = (max(rawYmin, rawYmax) / scaleDiv).coerceIn(ymin + 0.04f, 0.98f)
 
-            val screenLeft = cropX + xmin * minDim
-            val screenRight = cropX + xmax * minDim
-            val screenTop = cropY + ymin * minDim
-            val screenBottom = cropY + ymax * minDim
+            val boxCX = (xmin + xmax) * 0.5f
+            val boxCY = (ymin + ymax) * 0.5f
 
-            logDebug("✓ $category (${durationMs}ms) | X:[${String.format(Locale.US, "%.2f", xmin)}..${String.format(Locale.US, "%.2f", xmax)}] Y:[${String.format(Locale.US, "%.2f", ymin)}..${String.format(Locale.US, "%.2f", ymax)}] | Ang:${vlmAngleDeg}°")
+            val rawCX = (resultJson.optDouble("center_x", boxCX.toDouble()).toFloat() / scaleDiv).coerceIn(xmin, xmax)
+            val rawCY = (resultJson.optDouble("center_y", boxCY.toDouble()).toFloat() / scaleDiv).coerceIn(ymin, ymax)
 
-            fuseVlmAndContourGeometry(
-                bitmap, screenLeft, screenTop, screenRight, screenBottom,
-                vlmAngleDeg, vlmLengthCm, vlmWidthCm, vlmThicknessCm, category,
+            // Blend explicit visual center with bounding-box midpoint for rock-solid centering
+            val normCX = (rawCX * 0.6f + boxCX * 0.4f)
+            val normCY = (rawCY * 0.6f + boxCY * 0.4f)
+
+            val e1x = (resultJson.optDouble("end1_x", normCX.toDouble()).toFloat() / scaleDiv).coerceIn(0.02f, 0.98f)
+            val e1y = (resultJson.optDouble("end1_y", ymin.toDouble()).toFloat() / scaleDiv).coerceIn(0.02f, 0.98f)
+            val e2x = (resultJson.optDouble("end2_x", normCX.toDouble()).toFloat() / scaleDiv).coerceIn(0.02f, 0.98f)
+            val e2y = (resultJson.optDouble("end2_y", ymax.toDouble()).toFloat() / scaleDiv).coerceIn(0.02f, 0.98f)
+
+            val screenCX = cropX + normCX * minDim
+            val screenCY = cropY + normCY * minDim
+            val screenE1X = cropX + e1x * minDim
+            val screenE1Y = cropY + e1y * minDim
+            val screenE2X = cropX + e2x * minDim
+            val screenE2Y = cropY + e2y * minDim
+
+            logDebug("✓ $category (${durationMs}ms) | C:(${String.format(Locale.US, "%.2f", normCX)},${String.format(Locale.US, "%.2f", normCY)}) | E1:(${String.format(Locale.US, "%.2f", e1x)},${String.format(Locale.US, "%.2f", e1y)})->E2:(${String.format(Locale.US, "%.2f", e2x)},${String.format(Locale.US, "%.2f", e2y)})")
+
+            projectVlmDirect3D(
+                screenCX, screenCY,
+                screenE1X, screenE1Y, screenE2X, screenE2Y,
+                vlmLengthCm, vlmWidthCm, vlmThicknessCm, category,
                 invVpMatrix, anchor, camAngle, sWidth, sHeight
             )
 
@@ -590,13 +614,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Fuses VLM semantic bounding & physical dimensions with 2D oriented pixel contour PCA
-     * inside the crop, then locks onto the surface using gravity-aligned world coordinates.
+     * Directly unprojects the VLM's 2D object center and 2D centerline endpoints (end1 -> end2)
+     * onto the mid-height 3D horizontal plane (planeY + finalHeight * 0.5f).
+     * Eliminates vertical perspective shift, dark-object RGB drift, and diagonal bbox inflation.
      */
-    private fun fuseVlmAndContourGeometry(
-        fullBmp: Bitmap,
-        sLeft: Float, sTop: Float, sRight: Float, sBottom: Float,
-        vlmAngleDeg: Float, vlmLengthCm: Float, vlmWidthCm: Float, vlmThicknessCm: Float,
+    private fun projectVlmDirect3D(
+        screenCX: Float, screenCY: Float,
+        screenE1X: Float, screenE1Y: Float,
+        screenE2X: Float, screenE2Y: Float,
+        vlmLengthCm: Float, vlmWidthCm: Float, vlmThicknessCm: Float,
         category: String,
         invVpMatrix: FloatArray, anchor: Anchor,
         camAngle: Float, sWidth: Int, sHeight: Int
@@ -604,145 +630,58 @@ class MainActivity : AppCompatActivity() {
         val anchorPose = anchor.pose
         val planeY = anchorPose.ty()
 
-        val leftPx = sLeft.toInt().coerceIn(0, sWidth - 2)
-        val topPx = sTop.toInt().coerceIn(0, sHeight - 2)
-        val rightPx = sRight.toInt().coerceIn(leftPx + 10, sWidth)
-        val botPx = sBottom.toInt().coerceIn(topPx + 10, sHeight)
-        val cropW = rightPx - leftPx
-        val cropH = botPx - topPx
+        // 1. Compute vertical prism height first so we intersect rays at the object's 3D mid-height plane
+        val finalHeight = ((vlmThicknessCm / 100f) * 1.15f).coerceIn(0.038f, 0.18f)
+        val midPlaneY = planeY + finalHeight * 0.5f
 
-        // 1. Run 2D PCA Contour refinement inside the VLM bounding box for exact corner/side alignment
-        val cropBmp = Bitmap.createBitmap(fullBmp, leftPx, topPx, cropW, cropH)
-        val cTL = cropBmp.getPixel(2, 2)
-        val cTR = cropBmp.getPixel(cropW - 3, 2)
-        val cBL = cropBmp.getPixel(2, cropH - 3)
-        val cBR = cropBmp.getPixel(cropW - 3, cropH - 3)
-        val bgR = (Color.red(cTL) + Color.red(cTR) + Color.red(cBL) + Color.red(cBR)) / 4
-        val bgG = (Color.green(cTL) + Color.green(cTR) + Color.green(cBL) + Color.green(cBR)) / 4
-        val bgB = (Color.blue(cTL) + Color.blue(cTR) + Color.blue(cBL) + Color.blue(cBR)) / 4
-
-        var sumX = 0.0; var sumY = 0.0; var count = 0
-        val fgX = mutableListOf<Int>()
-        val fgY = mutableListOf<Int>()
-
-        for (y in 2 until cropH - 2 step 3) {
-            for (x in 2 until cropW - 2 step 3) {
-                val px = cropBmp.getPixel(x, y)
-                val diff = sqrt(
-                    ((Color.red(px) - bgR) * (Color.red(px) - bgR) +
-                     (Color.green(px) - bgG) * (Color.green(px) - bgG) +
-                     (Color.blue(px) - bgB) * (Color.blue(px) - bgB)).toDouble()
-                )
-                if (diff > 26.0) {
-                    sumX += x; sumY += y
-                    fgX.add(x); fgY.add(y)
-                    count++
-                }
-            }
-        }
-
-        val barX = if (count > 25) (sumX / count).toFloat() else cropW / 2f
-        val barY = if (count > 25) (sumY / count).toFloat() else cropH / 2f
-
-        // Convert VLM screen angle (0=vertical up-down, 90=horizontal left-right) to image PCA radians
-        val vlmThetaRad = Math.toRadians((90.0 - vlmAngleDeg)).toFloat()
-        var theta2D = vlmThetaRad
-
-        if (count > 40) {
-            var mu20 = 0.0; var mu02 = 0.0; var mu11 = 0.0
-            for (i in 0 until count) {
-                val dx = fgX[i] - barX
-                val dy = fgY[i] - barY
-                mu20 += dx * dx
-                mu02 += dy * dy
-                mu11 += dx * dy
-            }
-            val aniso = abs(mu20 - mu02) + abs(2.0 * mu11)
-            if (aniso > (count * 15.0)) {
-                val pcaTheta = (0.5 * atan2(2.0 * mu11, mu20 - mu02)).toFloat()
-                // Blend PCA pixel edge angle with VLM angle if consistent
-                theta2D = pcaTheta
-            }
-        }
-
-        val uX = cos(theta2D); val uY = sin(theta2D)
-        val vX = -sin(theta2D); val vY = cos(theta2D)
-
-        var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
-        var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
-
-        if (count > 40) {
-            for (i in 0 until count) {
-                val dx = fgX[i] - barX
-                val dy = fgY[i] - barY
-                val pu = dx * uX + dy * uY
-                val pv = dx * vX + dy * vY
-                minU = min(minU, pu); maxU = max(maxU, pu)
-                minV = min(minV, pv); maxV = max(maxV, pv)
-            }
-        } else {
-            val cornersX = floatArrayOf(-cropW * 0.46f, cropW * 0.46f, cropW * 0.46f, -cropW * 0.46f)
-            val cornersY = floatArrayOf(-cropH * 0.46f, -cropH * 0.46f, cropH * 0.46f, cropH * 0.46f)
-            for (c in 0 until 4) {
-                val pu = cornersX[c] * uX + cornersY[c] * uY
-                val pv = cornersX[c] * vX + cornersY[c] * vY
-                minU = min(minU, pu); maxU = max(maxU, pu)
-                minV = min(minV, pv); maxV = max(maxV, pv)
-            }
-        }
-
-        val halfSpan1Px = ((maxU - minU) * 0.5f).coerceAtLeast(18f)
-        val halfSpan2Px = ((maxV - minV) * 0.5f).coerceAtLeast(18f)
-
-        val screenCX = leftPx + barX
-        val screenCY = topPx + barY
-
-        // 2. Unproject center and oriented axes onto the horizontal gravity plane
-        val pCenterWorld = intersectScreenRayWithHorizontalPlane(screenCX, screenCY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p1AWorld = intersectScreenRayWithHorizontalPlane(screenCX + halfSpan1Px * uX, screenCY + halfSpan1Px * uY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p1BWorld = intersectScreenRayWithHorizontalPlane(screenCX - halfSpan1Px * uX, screenCY - halfSpan1Px * uY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p2AWorld = intersectScreenRayWithHorizontalPlane(screenCX + halfSpan2Px * vX, screenCY + halfSpan2Px * vY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-        val p2BWorld = intersectScreenRayWithHorizontalPlane(screenCX - halfSpan2Px * vX, screenCY - halfSpan2Px * vY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY)
-
-        if (pCenterWorld == null || p1AWorld == null || p1BWorld == null || p2AWorld == null || p2BWorld == null) {
-            logDebug("Ground ray projection fell outside plane bounds")
+        val pCenterMid = intersectScreenRayWithHorizontalPlane(
+            screenCX, screenCY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY
+        )
+        if (pCenterMid == null) {
+            logDebug("Center ray missed horizontal plane")
             return
         }
 
-        // Compute spans and unit vectors directly in gravity-aligned world coordinates (X, Z)
-        val v1X = p1AWorld[0] - p1BWorld[0]
-        val v1Z = p1AWorld[2] - p1BWorld[2]
-        val rawSpan1 = sqrt(v1X * v1X + v1Z * v1Z).coerceAtLeast(0.03f)
-        val u1X = v1X / rawSpan1
-        val u1Z = v1Z / rawSpan1
+        val pE1Mid = intersectScreenRayWithHorizontalPlane(
+            screenE1X, screenE1Y, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY
+        )
+        val pE2Mid = intersectScreenRayWithHorizontalPlane(
+            screenE2X, screenE2Y, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY
+        )
 
-        val v2X = p2AWorld[0] - p2BWorld[0]
-        val v2Z = p2AWorld[2] - p2BWorld[2]
-        val rawSpan2 = sqrt(v2X * v2X + v2Z * v2Z).coerceAtLeast(0.03f)
-        val u2X = v2X / rawSpan2
-        val u2Z = v2Z / rawSpan2
+        val vlmLongM = (max(vlmLengthCm, vlmWidthCm) / 100f).coerceIn(0.04f, 0.42f)
+        val vlmShortM = (min(vlmLengthCm, vlmWidthCm) / 100f).coerceIn(0.04f, 0.42f)
+        val aspect = (vlmShortM / vlmLongM).coerceIn(0.25f, 1.0f)
 
-        // Fuse ray-projected spans with VLM real physical dimensions to prevent steep-tilt stretching
-        val vlmMaxM = (max(vlmLengthCm, vlmWidthCm) / 100f).coerceIn(0.04f, 0.40f)
-        val vlmMinM = (min(vlmLengthCm, vlmWidthCm) / 100f).coerceIn(0.04f, 0.40f)
+        var uLongX = sin(camAngle)
+        var uLongZ = cos(camAngle)
+        var longSpanM = vlmLongM
+        var shortSpanM = vlmShortM
 
-        val span1: Float
-        val span2: Float
-        if (rawSpan1 >= rawSpan2) {
-            span1 = (rawSpan1 * 0.55f + vlmMaxM * 0.45f).coerceIn(0.04f, 0.45f)
-            span2 = (rawSpan2 * 0.55f + vlmMinM * 0.45f).coerceIn(0.04f, 0.45f)
-        } else {
-            span1 = (rawSpan1 * 0.55f + vlmMinM * 0.45f).coerceIn(0.04f, 0.45f)
-            span2 = (rawSpan2 * 0.55f + vlmMaxM * 0.45f).coerceIn(0.04f, 0.45f)
+        if (pE1Mid != null && pE2Mid != null) {
+            val dx = pE2Mid[0] - pE1Mid[0]
+            val dz = pE2Mid[2] - pE1Mid[2]
+            val rayLen = sqrt(dx * dx + dz * dz)
+            if (rayLen > 0.02f) {
+                uLongX = dx / rayLen
+                uLongZ = dz / rayLen
+                // Blend ray-projected 3D centerline length with VLM physical length
+                longSpanM = (rayLen * 0.55f + vlmLongM * 0.45f).coerceIn(0.04f, 0.42f)
+                shortSpanM = (longSpanM * aspect).coerceIn(0.04f, 0.42f)
+            }
         }
 
-        // Select the box face normal that points most directly toward the camera for Step 1 (FRONT)
+        // Perpendicular axis on the horizontal table plane
+        val uShortX = -uLongZ
+        val uShortZ = uLongX
+
+        // Choose which of the 4 box side normals points most directly toward the camera for Step 1 (FRONT)
         val camDirX = sin(camAngle)
         val camDirZ = cos(camAngle)
 
-        val dot0 = u1X * camDirX + u1Z * camDirZ
+        val dot0 = uLongX * camDirX + uLongZ * camDirZ
         val dot1 = -dot0
-        val dot2 = u2X * camDirX + u2Z * camDirZ
+        val dot2 = uShortX * camDirX + uShortZ * camDirZ
         val dot3 = -dot2
 
         val dots = floatArrayOf(dot0, dot1, dot2, dot3)
@@ -755,45 +694,42 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val pad = 1.06f
+        val pad = 1.05f
         val finalWidth: Float
         val finalDepth: Float
         val headingAngle: Float
 
         when (bestIdx) {
             0 -> {
-                finalDepth = (span1 * pad).coerceIn(0.04f, 0.45f)
-                finalWidth = (span2 * pad).coerceIn(0.04f, 0.45f)
-                headingAngle = atan2(u1X, u1Z)
+                finalDepth = (longSpanM * pad).coerceIn(0.04f, 0.45f)
+                finalWidth = (shortSpanM * pad).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(uLongX, uLongZ)
             }
             1 -> {
-                finalDepth = (span1 * pad).coerceIn(0.04f, 0.45f)
-                finalWidth = (span2 * pad).coerceIn(0.04f, 0.45f)
-                headingAngle = atan2(-u1X, -u1Z)
+                finalDepth = (longSpanM * pad).coerceIn(0.04f, 0.45f)
+                finalWidth = (shortSpanM * pad).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(-uLongX, -uLongZ)
             }
             2 -> {
-                finalDepth = (span2 * pad).coerceIn(0.04f, 0.45f)
-                finalWidth = (span1 * pad).coerceIn(0.04f, 0.45f)
-                headingAngle = atan2(u2X, u2Z)
+                finalDepth = (shortSpanM * pad).coerceIn(0.04f, 0.45f)
+                finalWidth = (longSpanM * pad).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(uShortX, uShortZ)
             }
             else -> {
-                finalDepth = (span2 * pad).coerceIn(0.04f, 0.45f)
-                finalWidth = (span1 * pad).coerceIn(0.04f, 0.45f)
-                headingAngle = atan2(-u2X, -u2Z)
+                finalDepth = (shortSpanM * pad).coerceIn(0.04f, 0.45f)
+                finalWidth = (longSpanM * pad).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(-uShortX, -uShortZ)
             }
         }
 
-        // Clamp vertical height so flat objects (phones) get a sleek 4cm cage instead of a 16cm tower
-        val finalHeight = ((vlmThicknessCm / 100f) * 1.15f).coerceIn(0.038f, 0.18f)
-
         runOnUiThread {
-            // Keep original Plane-attached anchor intact; store gravity-aligned world offset to center
-            centerOffsetX = pCenterWorld[0] - anchorPose.tx()
-            centerOffsetZ = pCenterWorld[2] - anchorPose.tz()
+            // Pin prism base directly under the 3D mid-height centroid
+            centerOffsetX = pCenterMid[0] - anchorPose.tx()
+            centerOffsetZ = pCenterMid[2] - anchorPose.tz()
 
-            smoothOriginX = pCenterWorld[0]
+            smoothOriginX = pCenterMid[0]
             smoothOriginY = planeY
-            smoothOriginZ = pCenterWorld[2]
+            smoothOriginZ = pCenterMid[2]
 
             initialAzimuth = headingAngle
             prismWidth = finalWidth
@@ -811,7 +747,7 @@ class MainActivity : AppCompatActivity() {
             logDebug("✓ Locked: $category (${wCm}×${dCm}×${hCm}cm) | Yaw: ${yawDeg}°")
             Toast.makeText(
                 this@MainActivity,
-                "✓ $category [${wCm}×${dCm}×${hCm}cm] Aligned",
+                "✓ $category [${wCm}×${dCm}×${hCm}cm] Yaw: ${yawDeg}°",
                 Toast.LENGTH_SHORT
             ).show()
         }
@@ -859,10 +795,6 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(rOx + t * dX, planeY, rOz + t * dZ)
     }
 
-    /**
-     * Updates tracking and applies an Exponential Moving Average (EMA) deadband filter
-     * to the anchor's world translation so the bounding box stays rock-solid without wobble.
-     */
     private fun updateStabilizedOrigin(anchor: Anchor) {
         val ap = anchor.pose
         val rawX = ap.tx() + centerOffsetX
@@ -878,7 +810,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         val drift = sqrt((rawX - smoothOriginX).pow(2) + (rawY - smoothOriginY).pow(2) + (rawZ - smoothOriginZ).pow(2))
-        // Ignore sub-millimeter VIO noise; smooth larger corrections gently
         if (drift > 0.0015f) {
             val alpha = if (drift > 0.04f) 0.35f else 0.12f
             smoothOriginX += alpha * (rawX - smoothOriginX)
@@ -1174,11 +1105,6 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(x * c + z * s, y, -x * s + z * c)
     }
 
-    /**
-     * Gravity-Locked World Transform:
-     * Uses ARCore's IMU gravity Y-axis and smoothed world origin instead of the plane's
-     * fluctuating normal quaternion, eliminating chair-armrest tilt wobble.
-     */
     private fun localToWorld(lx: Float, ly: Float, lz: Float): FloatArray {
         val rotated = rotateByAzimuth(lx, ly, lz)
         return floatArrayOf(
@@ -1297,7 +1223,7 @@ class MainActivity : AppCompatActivity() {
 
             if (!isBoxPlaced) {
                 val hitResults = frame.hitTest(screenW / 2f, screenH / 2f)
-                val hit = hitResults.firstOrNull()
+                val hit = hitResults.firstOrNull { it.trackable is Plane } ?: hitResults.firstOrNull()
                 if (hit != null) {
                     val hp = hit.hitPose
                     val diskRadius = 0.09f
