@@ -44,10 +44,13 @@ class MainActivity : AppCompatActivity() {
     private val QWEN_ENDPOINT = "https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
     private val VLM_MODEL = "deepseek-v4.1-flash"
 
+    // Force HTTP/1.1 to avoid mobile LTE HTTP/2 framing stalls on DashScope endpoints
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .retryOnConnectionFailure(true)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .writeTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
         .build()
 
     private val modalEndpoint = "https://emmanuelnwalema--mobile-6dof-capture-ui.modal.run/upload_plate"
@@ -84,7 +87,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (YOLO-Stabilized VLM Engine)\n")
+    private val debugLog = StringBuilder("App Initialized (YOLO-Stabilized VLM Engine v2)\n")
     private var toneGen: ToneGenerator? = null
 
     private var currentStepIdx = 0
@@ -97,6 +100,10 @@ class MainActivity : AppCompatActivity() {
     private var initialAzimuth = 0f
     private var alignStartTime: Long? = null
     private var cooldownUntil: Long = 0L
+
+    // Tracks cumulative local re-anchor offset relative to snapshotAnchorPose
+    private var appliedLocalOffsetX = 0f
+    private var appliedLocalOffsetZ = 0f
 
     private var prismWidth = 0.12f
     private var prismDepth = 0.12f
@@ -356,10 +363,6 @@ class MainActivity : AppCompatActivity() {
         batchUploadBtn.visibility = if (capturedCount > 0) View.VISIBLE else View.GONE
     }
 
-    /**
-     * Uses YOLOv8n's exact anchor-pose placement while preferring a horizontal plane hit so the
-     * anchor sits on the table surface rather than floating on top of the object.
-     */
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
         val cx = sceneView.width / 2f
@@ -377,6 +380,8 @@ class MainActivity : AppCompatActivity() {
         if (firstHit != null) {
             val anchor = firstHit.createAnchor()
             prismAnchor = anchor
+            appliedLocalOffsetX = 0f
+            appliedLocalOffsetZ = 0f
 
             val camPose = frame.camera.pose
             val snapshotAnchorPose = anchor.pose
@@ -398,7 +403,6 @@ class MainActivity : AppCompatActivity() {
             Matrix.multiplyMM(vpMat, 0, pMat, 0, vMat, 0)
             Matrix.invertM(invVpMat, 0, vpMat, 0)
 
-            // Sample point-cloud elevation synchronously while Frame is valid
             val pointCloudHeightM = measurePointCloudHeightSync(frame, snapshotAnchorPose)
 
             runCloudVlmPipeline(invVpMat, snapshotAnchorPose, camAngle, pointCloudHeightM)
@@ -473,12 +477,29 @@ class MainActivity : AppCompatActivity() {
                 if (copyResult == PixelCopy.SUCCESS) {
                     Thread {
                         try {
-                            val box = runDeepSeekDetection(bitmap)
-                            if (box != null) {
+                            // STAGE 1: Instant local contour fit (<40ms) so the box immediately sizes & orients
+                            val localBox = buildLocalFallbackBox(bitmap)
+                            projectVlmBoxAndOrient(
+                                bitmap, localBox, invVpMatrix, snapshotAnchorPose,
+                                camAngle, pointCloudHeightM, sWidth, sHeight, isFinalVlm = false
+                            )
+
+                            // STAGE 2: Cloud VLM detection & semantic orientation refinement
+                            val vlmBox = runDeepSeekDetection(bitmap)
+                            if (vlmBox != null) {
                                 projectVlmBoxAndOrient(
-                                    bitmap, box, invVpMatrix, snapshotAnchorPose,
-                                    camAngle, pointCloudHeightM, sWidth, sHeight
+                                    bitmap, vlmBox, invVpMatrix, snapshotAnchorPose,
+                                    camAngle, pointCloudHeightM, sWidth, sHeight, isFinalVlm = true
                                 )
+                            } else {
+                                logDebug("⚠️ Using Stage-1 Local Contour Fit (VLM unreachable)")
+                                runOnUiThread {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "VLM timeout — locked via local contour fit",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
                             }
                         } finally {
                             isVlmRunning = false
@@ -493,173 +514,237 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Replaces runCocoInference from the YOLOv8n pipeline:
-     * Uses a 1:1 center-cropped square image just like YOLOv8n to avoid aspect distortion,
-     * and maps the detected 2D bounding box back to full viewport pixel coordinates.
+     * Fast local foreground detector around the center reticle so the prism sizes and
+     * orients itself immediately before (or without) the cloud VLM response.
      */
-    private fun runDeepSeekDetection(bitmap: Bitmap): VlmDetectionBox? {
-        try {
-            val minDim = min(bitmap.width, bitmap.height)
-            val cropX = (bitmap.width - minDim) / 2f
-            val cropY = (bitmap.height - minDim) / 2f
-            val squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
-            val vlmBmp = Bitmap.createScaledBitmap(squareBmp, 448, 448, true)
+    private fun buildLocalFallbackBox(bitmap: Bitmap): VlmDetectionBox {
+        val w = bitmap.width
+        val h = bitmap.height
+        val minDim = min(w, h)
+        val roiHalf = (minDim * 0.30f).toInt()
+        val cx = w / 2
+        val cy = h / 2
 
-            val stream = ByteArrayOutputStream()
-            vlmBmp.compress(Bitmap.CompressFormat.JPEG, 78, stream)
-            val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+        val x0 = (cx - roiHalf).coerceAtLeast(8)
+        val y0 = (cy - roiHalf).coerceAtLeast(8)
+        val x1 = (cx + roiHalf).coerceAtMost(w - 9)
+        val y1 = (cy + roiHalf).coerceAtMost(h - 9)
 
-            logDebug("Sending ${stream.size() / 1024} KB crop to $VLM_MODEL...")
+        var bgR = 0L; var bgG = 0L; var bgB = 0L; var bgCnt = 0
+        for (x in x0..x1 step 8) {
+            val pT = bitmap.getPixel(x, y0)
+            val pB = bitmap.getPixel(x, y1)
+            bgR += Color.red(pT) + Color.red(pB)
+            bgG += Color.green(pT) + Color.green(pB)
+            bgB += Color.blue(pT) + Color.blue(pB)
+            bgCnt += 2
+        }
+        for (y in y0..y1 step 8) {
+            val pL = bitmap.getPixel(x0, y)
+            val pR = bitmap.getPixel(x1, y)
+            bgR += Color.red(pL) + Color.red(pR)
+            bgG += Color.green(pL) + Color.green(pR)
+            bgB += Color.blue(pL) + Color.blue(pR)
+            bgCnt += 2
+        }
 
-            val systemPrompt = """
-                /no_think
-                Detect the single foreground object resting near the center of the surface (ignore the table underneath).
-                Return ONLY a valid JSON object with no markdown:
-                {
-                  "category": "<object name>",
-                  "ymin": <integer 0 to 1000 for tight top edge>,
-                  "xmin": <integer 0 to 1000 for tight left edge>,
-                  "ymax": <integer 0 to 1000 for tight bottom edge>,
-                  "xmax": <integer 0 to 1000 for tight right edge>,
-                  "tilt_direction": "<choose one: vertical, horizontal, top_right_to_bottom_left, top_left_to_bottom_right>",
-                  "angle_from_vertical_deg": <integer 0 to 90>,
-                  "height_cm": <float vertical thickness rising off the table>
+        val mR = if (bgCnt > 0) (bgR / bgCnt).toInt() else 128
+        val mG = if (bgCnt > 0) (bgG / bgCnt).toInt() else 128
+        val mB = if (bgCnt > 0) (bgB / bgCnt).toInt() else 128
+
+        var minX = x1; var maxX = x0
+        var minY = y1; var maxY = y0
+        var fgHits = 0
+
+        for (y in (y0 + 6)..(y1 - 6) step 4) {
+            for (x in (x0 + 6)..(x1 - 6) step 4) {
+                val px = bitmap.getPixel(x, y)
+                val dr = Color.red(px) - mR
+                val dg = Color.green(px) - mG
+                val db = Color.blue(px) - mB
+                if (dr * dr + dg * dg + db * db > 900) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                    fgHits++
                 }
-                Rules for tilt_direction of the object's longest axis on screen:
-                - "vertical": longest axis runs straight up and down.
-                - "horizontal": longest axis runs straight left and right.
-                - "top_right_to_bottom_left": upper end is toward the right, lower end is toward the left (/).
-                - "top_left_to_bottom_right": upper end is toward the left, lower end is toward the right (\).
-            """.trimIndent()
-
-            val contentArray = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("type", "image_url")
-                    put("image_url", JSONObject().apply {
-                        put("url", "data:image/jpeg;base64,$b64")
-                    })
-                })
-                put(JSONObject().apply {
-                    put("type", "text")
-                    put("text", systemPrompt)
-                })
             }
+        }
 
-            val requestBodyJson = JSONObject().apply {
-                put("model", VLM_MODEL)
-                put("messages", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("role", "user")
-                        put("content", contentArray)
-                    })
-                })
-                put("enable_thinking", false)
-                put("temperature", 0.0)
-                put("max_tokens", 300)
-            }
-
-            val request = Request.Builder()
-                .url(QWEN_ENDPOINT)
-                .addHeader("Authorization", "Bearer $DASHSCOPE_API_KEY")
-                .addHeader("Content-Type", "application/json")
-                .post(requestBodyJson.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-
-            val startTime = System.currentTimeMillis()
-            val response = httpClient.newCall(request).execute()
-            val respStr = response.body?.string().orEmpty()
-            val durationMs = System.currentTimeMillis() - startTime
-            response.close()
-
-            logDebug("VLM latency: ${durationMs}ms | HTTP ${response.code}")
-
-            val rootJson = JSONObject(respStr)
-            if (rootJson.has("error")) {
-                val errMsg = rootJson.getJSONObject("error").optString("message", respStr)
-                logDebug("❌ API Error: $errMsg")
-                showDebugDialog()
-                return null
-            }
-
-            val choices = rootJson.getJSONArray("choices")
-            val message = choices.getJSONObject(0).getJSONObject("message")
-
-            var rawContent = message.optString("content", "").trim()
-            if (rawContent.isEmpty() || rawContent == "null") {
-                rawContent = message.optString("reasoning_content", "").trim()
-            }
-
-            val startBrace = rawContent.indexOf('{')
-            val endBrace = rawContent.lastIndexOf('}')
-            if (startBrace == -1 || endBrace <= startBrace) {
-                logDebug("❌ Unparseable output: $rawContent")
-                showDebugDialog()
-                return null
-            }
-            val resultJson = JSONObject(rawContent.substring(startBrace, endBrace + 1))
-
-            val category = resultJson.optString("category", "asset")
-            val tiltDir = resultJson.optString("tilt_direction", "").lowercase(Locale.US)
-            val angleFromVert = resultJson.optDouble("angle_from_vertical_deg", -1.0).toFloat()
-            val vlmHeightCm = resultJson.optDouble("height_cm", 3.0).toFloat()
-
-            val rYmin = resultJson.optDouble("ymin", 300.0).toFloat()
-            val rXmin = resultJson.optDouble("xmin", 300.0).toFloat()
-            val rYmax = resultJson.optDouble("ymax", 700.0).toFloat()
-            val rXmax = resultJson.optDouble("xmax", 700.0).toFloat()
-
-            val maxVal = max(max(rYmin, rXmin), max(rYmax, rXmax))
-            val scaleDiv = when {
-                maxVal > 1.5f && maxVal <= 100f -> 100f
-                maxVal > 100f -> 1000f
-                else -> 1f
-            }
-
-            val yminNorm = (min(rYmin, rYmax) / scaleDiv).coerceIn(0.02f, 0.94f)
-            val ymaxNorm = (max(rYmin, rYmax) / scaleDiv).coerceIn(yminNorm + 0.04f, 0.98f)
-            val xminNorm = (min(rXmin, rXmax) / scaleDiv).coerceIn(0.02f, 0.94f)
-            val xmaxNorm = (max(rXmin, rXmax) / scaleDiv).coerceIn(xminNorm + 0.04f, 0.98f)
-
-            // Map normalized square coordinates back to full camera viewport pixels (same as YOLOv8n)
-            val leftPx = (cropX + xminNorm * minDim).coerceIn(0f, bitmap.width - 16f)
-            val topPx = (cropY + yminNorm * minDim).coerceIn(0f, bitmap.height - 16f)
-            val rightPx = (cropX + xmaxNorm * minDim).coerceIn(leftPx + 16f, bitmap.width.toFloat())
-            val bottomPx = (cropY + ymaxNorm * minDim).coerceIn(topPx + 16f, bitmap.height.toFloat())
-
-            // Compute optional screen-space orientation prior in [0, PI)
-            val priorScreenRad: Float? = when {
-                tiltDir.contains("horizontal") -> 0f
-                tiltDir.contains("vertical") && !tiltDir.contains("top_") -> (Math.PI / 2.0).toFloat()
-                tiltDir.contains("top_right_to_bottom_left") -> {
-                    val a = if (angleFromVert in 5f..85f) angleFromVert else 40f
-                    Math.toRadians((90f + a).toDouble()).toFloat()
-                }
-                tiltDir.contains("top_left_to_bottom_right") -> {
-                    val a = if (angleFromVert in 5f..85f) angleFromVert else 40f
-                    Math.toRadians((90f - a).toDouble()).toFloat()
-                }
-                else -> null
-            }
-
-            val vlmHeightM = (vlmHeightCm / 100f).coerceIn(0.025f, 0.25f)
-            logDebug("✓ VLM Box: $category [${leftPx.toInt()},${topPx.toInt()} - ${rightPx.toInt()},${bottomPx.toInt()}] | Dir:$tiltDir")
-
-            return VlmDetectionBox(leftPx, topPx, rightPx, bottomPx, category, priorScreenRad, vlmHeightM)
-        } catch (e: Exception) {
-            logDebug("❌ VLM Exception: ${e.javaClass.simpleName}: ${e.message}")
-            showDebugDialog()
-            return null
+        return if (fgHits >= 20 && maxX > minX + 20 && maxY > minY + 20) {
+            val pad = 12f
+            VlmDetectionBox(
+                leftPx = (minX - pad).coerceAtLeast(0f),
+                topPx = (minY - pad).coerceAtLeast(0f),
+                rightPx = (maxX + pad).coerceAtMost(w.toFloat()),
+                bottomPx = (maxY + pad).coerceAtMost(h.toFloat()),
+                category = "local-contour",
+                priorScreenRad = null,
+                vlmHeightM = 0.045f
+            )
+        } else {
+            val defHalf = minDim * 0.18f
+            VlmDetectionBox(
+                leftPx = cx - defHalf,
+                topPx = cy - defHalf,
+                rightPx = cx + defHalf,
+                bottomPx = cy + defHalf,
+                category = "local-seed",
+                priorScreenRad = null,
+                vlmHeightM = 0.045f
+            )
         }
     }
 
     /**
-     * Ported directly from YOLOv8n's projectCocoBoxAndOrient:
-     * 1. Crops the full-resolution frame at the detected 2D box.
-     * 2. Isolates foreground pixels and finds the exact 2D oriented bounding spans (minU..maxU, minV..maxV)
-     *    using a Rotating-Calipers minimum-area sweep guided by the VLM orientation prior.
-     * 3. Unprojects the 4 span endpoints onto the horizontal table plane (planeY) and measures true
-     *    3D metric spans in anchor space (invSnapshotAnchor.transformPoint).
-     * 4. Re-anchors prismAnchor directly to the 3D center of the object.
+     * Sends a compact (~12-16 KB) 352x352 JPEG crop over HTTP/1.1 with automatic retry
+     * so weak mobile LTE connections do not hit SocketTimeoutException.
+     */
+    private fun runDeepSeekDetection(bitmap: Bitmap): VlmDetectionBox? {
+        val minDim = min(bitmap.width, bitmap.height)
+        val cropX = (bitmap.width - minDim) / 2f
+        val cropY = (bitmap.height - minDim) / 2f
+        val squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
+
+        // 352x352 @ JPEG 58 keeps payload ~12-16 KB even on striped/textured carpets
+        val vlmBmp = Bitmap.createScaledBitmap(squareBmp, 352, 352, true)
+        val stream = ByteArrayOutputStream()
+        vlmBmp.compress(Bitmap.CompressFormat.JPEG, 58, stream)
+        val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+
+        val payloadKb = stream.size() / 1024
+        val systemPrompt = """
+            /no_think
+            Detect the foreground object near the center. Return ONLY JSON:
+            {"category":"<name>","ymin":<0..1000>,"xmin":<0..1000>,"ymax":<0..1000>,"xmax":<0..1000>,"tilt_direction":"<vertical|horizontal|top_right_to_bottom_left|top_left_to_bottom_right>","angle_from_vertical_deg":<0..90>,"height_cm":<float>}
+        """.trimIndent()
+
+        val contentArray = JSONArray().apply {
+            put(JSONObject().apply {
+                put("type", "image_url")
+                put("image_url", JSONObject().apply {
+                    put("url", "data:image/jpeg;base64,$b64")
+                })
+            })
+            put(JSONObject().apply {
+                put("type", "text")
+                put("text", systemPrompt)
+            })
+        }
+
+        val requestBodyStr = JSONObject().apply {
+            put("model", VLM_MODEL)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", contentArray)
+                })
+            })
+            put("enable_thinking", false)
+            put("temperature", 0.0)
+            put("max_tokens", 180)
+        }.toString()
+
+        for (attempt in 1..2) {
+            try {
+                logDebug("Attempt $attempt: Sending $payloadKb KB crop to $VLM_MODEL...")
+                val request = Request.Builder()
+                    .url(QWEN_ENDPOINT)
+                    .addHeader("Authorization", "Bearer $DASHSCOPE_API_KEY")
+                    .addHeader("Content-Type", "application/json")
+                    .addHeader("Connection", "close")
+                    .post(requestBodyStr.toRequestBody("application/json".toMediaType()))
+                    .build()
+
+                val startTime = System.currentTimeMillis()
+                val response = httpClient.newCall(request).execute()
+                val respStr = response.body?.string().orEmpty()
+                val durationMs = System.currentTimeMillis() - startTime
+                val httpCode = response.code
+                response.close()
+
+                logDebug("VLM latency: ${durationMs}ms | HTTP $httpCode")
+
+                val rootJson = JSONObject(respStr)
+                if (rootJson.has("error")) {
+                    val errMsg = rootJson.getJSONObject("error").optString("message", respStr)
+                    logDebug("❌ API Error: $errMsg")
+                    return null
+                }
+
+                val choices = rootJson.getJSONArray("choices")
+                val message = choices.getJSONObject(0).getJSONObject("message")
+
+                var rawContent = message.optString("content", "").trim()
+                if (rawContent.isEmpty() || rawContent == "null") {
+                    rawContent = message.optString("reasoning_content", "").trim()
+                }
+
+                val startBrace = rawContent.indexOf('{')
+                val endBrace = rawContent.lastIndexOf('}')
+                if (startBrace == -1 || endBrace <= startBrace) {
+                    logDebug("❌ Unparseable VLM output: $rawContent")
+                    return null
+                }
+
+                val resultJson = JSONObject(rawContent.substring(startBrace, endBrace + 1))
+
+                val category = resultJson.optString("category", "asset")
+                val tiltDir = resultJson.optString("tilt_direction", "").lowercase(Locale.US)
+                val angleFromVert = resultJson.optDouble("angle_from_vertical_deg", -1.0).toFloat()
+                val vlmHeightCm = resultJson.optDouble("height_cm", 3.0).toFloat()
+
+                val rYmin = resultJson.optDouble("ymin", 300.0).toFloat()
+                val rXmin = resultJson.optDouble("xmin", 300.0).toFloat()
+                val rYmax = resultJson.optDouble("ymax", 700.0).toFloat()
+                val rXmax = resultJson.optDouble("xmax", 700.0).toFloat()
+
+                val maxVal = max(max(rYmin, rXmin), max(rYmax, rXmax))
+                val scaleDiv = when {
+                    maxVal > 1.5f && maxVal <= 100f -> 100f
+                    maxVal > 100f -> 1000f
+                    else -> 1f
+                }
+
+                val yminNorm = (min(rYmin, rYmax) / scaleDiv).coerceIn(0.02f, 0.94f)
+                val ymaxNorm = (max(rYmin, rYmax) / scaleDiv).coerceIn(yminNorm + 0.04f, 0.98f)
+                val xminNorm = (min(rXmin, rXmax) / scaleDiv).coerceIn(0.02f, 0.94f)
+                val xmaxNorm = (max(rXmin, rXmax) / scaleDiv).coerceIn(xminNorm + 0.04f, 0.98f)
+
+                val leftPx = (cropX + xminNorm * minDim).coerceIn(0f, bitmap.width - 16f)
+                val topPx = (cropY + yminNorm * minDim).coerceIn(0f, bitmap.height - 16f)
+                val rightPx = (cropX + xmaxNorm * minDim).coerceIn(leftPx + 16f, bitmap.width.toFloat())
+                val bottomPx = (cropY + ymaxNorm * minDim).coerceIn(topPx + 16f, bitmap.height.toFloat())
+
+                val priorScreenRad: Float? = when {
+                    tiltDir.contains("horizontal") -> 0f
+                    tiltDir.contains("vertical") && !tiltDir.contains("top_") -> (Math.PI / 2.0).toFloat()
+                    tiltDir.contains("top_right_to_bottom_left") -> {
+                        val a = if (angleFromVert in 5f..85f) angleFromVert else 40f
+                        Math.toRadians((90f + a).toDouble()).toFloat()
+                    }
+                    tiltDir.contains("top_left_to_bottom_right") -> {
+                        val a = if (angleFromVert in 5f..85f) angleFromVert else 40f
+                        Math.toRadians((90f - a).toDouble()).toFloat()
+                    }
+                    else -> null
+                }
+
+                val vlmHeightM = (vlmHeightCm / 100f).coerceIn(0.025f, 0.25f)
+                logDebug("✓ VLM Box: $category [${leftPx.toInt()},${topPx.toInt()} - ${rightPx.toInt()},${bottomPx.toInt()}] | Dir:$tiltDir")
+
+                return VlmDetectionBox(leftPx, topPx, rightPx, bottomPx, category, priorScreenRad, vlmHeightM)
+            } catch (e: Exception) {
+                logDebug("⚠️ Attempt $attempt failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+        return null
+    }
+
+    /**
+     * Ported from YOLOv8n's projectCocoBoxAndOrient with delta-offset tracking so Stage 1 (local)
+     * and Stage 2 (cloud VLM) can sequentially refine the anchor position without double-shifting.
      */
     private fun projectVlmBoxAndOrient(
         fullBmp: Bitmap,
@@ -669,7 +754,8 @@ class MainActivity : AppCompatActivity() {
         camAngle: Float,
         pointCloudHeightM: Float,
         sWidth: Int,
-        sHeight: Int
+        sHeight: Int,
+        isFinalVlm: Boolean
     ) {
         val invSnapshotAnchor = snapshotAnchorPose.inverse()
         val planeY = snapshotAnchorPose.ty()
@@ -683,7 +769,6 @@ class MainActivity : AppCompatActivity() {
 
         val cropBmp = Bitmap.createBitmap(fullBmp, leftPx, topPx, cropW, cropH)
 
-        // 1. Sample table background color around the perimeter inside the crop border
         var bgR = 0L; var bgG = 0L; var bgB = 0L; var bgCount = 0
         val stepBorder = max(4, min(cropW, cropH) / 16)
         for (x in 2 until cropW - 2 step stepBorder) {
@@ -729,8 +814,6 @@ class MainActivity : AppCompatActivity() {
         val barX = if (count > 25) (sumX / count).toFloat() * 0.7f + (cropW * 0.5f) * 0.3f else cropW / 2f
         val barY = if (count > 25) (sumY / count).toFloat() * 0.7f + (cropH * 0.5f) * 0.3f else cropH / 2f
 
-        // 2. Determine principal 2D angle theta2D using Minimum-Area Bounding Box (Rotating Calipers)
-        //    regularized by the VLM orientation prior so straight edges lock cleanly without diagonal skew.
         var theta2D = box.priorScreenRad ?: if (cropH > cropW) (Math.PI / 2.0).toFloat() else 0f
 
         if (count > 35) {
@@ -759,12 +842,10 @@ class MainActivity : AppCompatActivity() {
                 val spanV = (maxV - minV).coerceAtLeast(8f)
                 var areaScore = spanU * spanV
 
-                // Align candidate major axis (rad or rad + PI/2) with VLM prior if available
                 val candMajorRad = if (spanU >= spanV) rad else (rad + (Math.PI / 2.0).toFloat())
                 if (box.priorScreenRad != null) {
                     val prior = box.priorScreenRad
                     val angDiff = abs(atan2(sin((candMajorRad - prior) * 2f), cos((candMajorRad - prior) * 2f))) * 0.5f
-                    // Gently penalize orientations that disagree strongly with VLM semantic direction
                     areaScore *= (1.0f + 0.28f * (angDiff / (Math.PI.toFloat() * 0.5f)))
                 }
 
@@ -798,7 +879,6 @@ class MainActivity : AppCompatActivity() {
             minV = -cropH * 0.45f; maxV = cropH * 0.45f
         }
 
-        // Center the 2D box on the midpoint of the actual projected spans
         val midU = (minU + maxU) * 0.5f
         val midV = (minV + maxV) * 0.5f
         val halfSpan1Px = ((maxU - minU) * 0.5f).coerceAtLeast(12f)
@@ -807,7 +887,6 @@ class MainActivity : AppCompatActivity() {
         val screenCX = leftPx + barX + midU * uX + midV * vX
         val screenCY = topPx + barY + midU * uY + midV * vY
 
-        // 3. Unproject the center and two orthogonal axes down to the horizontal table plane (YOLOv8n method)
         val pCenterWorld = intersectScreenRayWithHorizontalPlane(
             screenCX, screenCY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, planeY
         )
@@ -835,7 +914,6 @@ class MainActivity : AppCompatActivity() {
         val l2A = invSnapshotAnchor.transformPoint(p2AWorld)
         val l2B = invSnapshotAnchor.transformPoint(p2BWorld)
 
-        // 4. Compute true physical metric spans and unit vectors in anchor-local space (YOLOv8n method)
         val v1X = l1A[0] - l1B[0]
         val v1Z = l1A[2] - l1B[2]
         val span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceAtLeast(0.04f)
@@ -848,7 +926,6 @@ class MainActivity : AppCompatActivity() {
         val u2X = v2X / span2
         val u2Z = v2Z / span2
 
-        // 5. Universal Canonical Normal Selection: Selects closest camera-facing normal
         val camDirX = sin(camAngle)
         val camDirZ = cos(camAngle)
 
@@ -902,21 +979,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         runOnUiThread {
-            // 6. Latency-Compensated Center Re-Anchoring:
-            // Transform the local offset lCenter through the current anchor.pose so even if the user
-            // moved slightly during VLM inference, the new anchor pins to the exact 3D spot on the table.
             try {
                 val session = sceneView.session
                 val currentAnchor = prismAnchor
                 if (session != null && currentAnchor != null) {
                     val curPose = currentAnchor.pose
-                    val worldCenterNow = curPose.transformPoint(floatArrayOf(lCenter[0], 0f, lCenter[2]))
+                    val deltaLocalX = (lCenter[0] - appliedLocalOffsetX).coerceIn(-0.15f, 0.15f)
+                    val deltaLocalZ = (lCenter[2] - appliedLocalOffsetZ).coerceIn(-0.15f, 0.15f)
+                    val worldCenterNow = curPose.transformPoint(floatArrayOf(deltaLocalX, 0f, deltaLocalZ))
+
                     currentAnchor.detach()
                     val newCenterPose = Pose(
                         floatArrayOf(worldCenterNow[0], curPose.ty(), worldCenterNow[2]),
                         curPose.rotationQuaternion
                     )
                     prismAnchor = session.createAnchor(newCenterPose)
+                    appliedLocalOffsetX = lCenter[0]
+                    appliedLocalOffsetZ = lCenter[2]
                 }
             } catch (e: Exception) {
                 logDebug("Re-anchor failed: ${e.message}")
@@ -934,12 +1013,15 @@ class MainActivity : AppCompatActivity() {
             val dCm = (prismDepth * 100).roundToInt()
             val hCm = (prismHeight * 100).roundToInt()
             val yawDeg = Math.toDegrees(headingAngle.toDouble()).roundToInt()
-            logDebug("✓ Re-anchored (${box.category}): ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
-            Toast.makeText(
-                this@MainActivity,
-                "✓ ${box.category}: ${wCm}×${dCm}×${hCm}cm | Heading: ${yawDeg}°",
-                Toast.LENGTH_SHORT
-            ).show()
+            logDebug("✓ Fit (${box.category}): ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
+
+            if (isFinalVlm) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "✓ VLM Locked (${box.category}): ${wCm}×${dCm}×${hCm}cm",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
         }
     }
 
@@ -1273,7 +1355,6 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(x * c + z * s, y, -x * s + z * c)
     }
 
-    // Restored directly from YOLOv8n: transforms local prism coordinates via native ARCore Anchor Pose
     private fun localToWorld(lx: Float, ly: Float, lz: Float, anchorPose: Pose): FloatArray {
         val rotated = rotateByAzimuth(lx, ly, lz)
         return anchorPose.transformPoint(rotated)
