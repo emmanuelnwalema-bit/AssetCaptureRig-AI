@@ -72,7 +72,7 @@ class MainActivity : AppCompatActivity() {
     private val httpClient = OkHttpClient()
     private val modalEndpoint = "https://emmanuelnwalema--mobile-6dof-capture-ui.modal.run/upload_plate"
 
-    private val debugLog = StringBuilder("App Initialized (WebXR Cling Ring Engine)\n")
+    private val debugLog = StringBuilder("App Initialized (3D Encapsulating Ring Engine)\n")
     private var toneGen: ToneGenerator? = null
 
     private var currentStepIdx = 0
@@ -90,15 +90,15 @@ class MainActivity : AppCompatActivity() {
     private var prismHeight = 0.05f
 
     // =========================================================
-    // WEBXR LIVE MAGNETIC CLING RING STATE
+    // 3D ENCAPSULATING RING LIVE STATE
     // =========================================================
     private var hasLiveCling = false
     private var liveClingConfidence = 0
     private var liveWorldX = 0f
     private var liveWorldY = 0f
     private var liveWorldZ = 0f
-    private var liveWidth = 0.09f
-    private var liveDepth = 0.09f
+    private var liveWidth = 0.10f
+    private var liveDepth = 0.10f
     private var liveHeight = 0.045f
     private var liveAzimuth = 0f
     private var liveCos2A = 1f
@@ -166,7 +166,7 @@ class MainActivity : AppCompatActivity() {
         fullPreviewLabel = findViewById(R.id.fullPreviewLabel)
         closePreviewBtn = findViewById(R.id.closePreviewBtn)
 
-        // Shift the middle HUD status card upward so the center aiming area is 100% unobstructed
+        // Keep the status banner lifted above the center aiming zone
         (distIndicator.parent as? View)?.let { hudBanner ->
             hudBanner.post {
                 val liftPx = -resources.displayMetrics.heightPixels * 0.22f
@@ -261,7 +261,7 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("WebXR Cling Diagnostics")
+                .setTitle("3D Encapsulating Ring Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
@@ -358,15 +358,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // STRIPE-IMMUNE, BASE-GROUNDED WEBXR RING CLING ENGINE
+    // OUTSIDE-IN SILHOUETTE DETECTOR & 3D ENCAPSULATING RING ENGINE
     // =========================================================================
     /**
-     * 1. Samples a 29x29 interior grid in YUV space.
-     * 2. Uses a 2D Structure Tensor on the outer border to detect 1D background stripe direction
-     *    and cancels border-connected background bands so black cases on black stripes and
-     *    white bottles on white stripes are never erased.
-     * 3. Grounds the 3D ring to the front-most base contact edge on the table and compensates
-     *    for vertical height relief so tall cylinders/bottles don't stretch backward.
+     * Captures the ENTIRE outer silhouette of the asset (never getting trapped inside
+     * specular reflections or internal box graphics) by:
+     * 1. Determining the 1D background stripe orientation from the outer border frame.
+     * 2. Predicting the background color at every interior cell by projecting along the
+     *    stripe axis to the outer border ring.
+     * 3. Combining along-stripe residual + cross-stripe edge damming + outer-border flood fill
+     *    so any internal hole (glare, logos, camera bars) is filled solid inside the outer boundary.
+     * 4. Unprojecting the 2D silhouette at the asset's 3D mid-height plane (planeY + H/2) so the
+     *    3D encapsulating ring wraps around the entire asset in perspective.
      */
     private fun updateLiveClingReticle(frame: Frame, planeHitPose: Pose) {
         val sWidth = sceneView.width.toFloat()
@@ -393,20 +396,20 @@ class MainActivity : AppCompatActivity() {
             val uvPixStride = uPlane.pixelStride
 
             val minDim = min(sWidth, sHeight)
-            val roiHalf = minDim * 0.30f
+            val roiHalf = minDim * 0.34f
 
             val searchCX = if (hasLiveCling) {
-                (sWidth * 0.5f) * 0.70f + liveClingScreenX * 0.30f
+                (sWidth * 0.5f) * 0.72f + liveClingScreenX * 0.28f
             } else {
                 sWidth * 0.5f
             }
             val searchCY = if (hasLiveCling) {
-                (sHeight * 0.5f) * 0.70f + liveClingScreenY * 0.30f
+                (sHeight * 0.5f) * 0.72f + liveClingScreenY * 0.28f
             } else {
                 sHeight * 0.5f
             }
 
-            val gridN = 29
+            val gridN = 31
             val numGrid = gridN * gridN
             val viewPts = FloatArray(numGrid * 2)
             val imgPts = FloatArray(numGrid * 2)
@@ -436,7 +439,6 @@ class MainActivity : AppCompatActivity() {
                 val ix = imgPts[g * 2].toInt().coerceIn(1, imgW - 2)
                 val iy = imgPts[g * 2 + 1].toInt().coerceIn(1, imgH - 2)
 
-                // 2x2 box filter in Y for anti-aliased luminance
                 val y00 = yBuf.get(iy * yRowStride + ix * yPixStride).toInt() and 0xFF
                 val y10 = yBuf.get(iy * yRowStride + (ix + 1) * yPixStride).toInt() and 0xFF
                 val y01 = yBuf.get((iy + 1) * yRowStride + ix * yPixStride).toInt() and 0xFF
@@ -448,20 +450,12 @@ class MainActivity : AppCompatActivity() {
                 cellV[g] = vBuf.get(uvOff).toInt() and 0xFF
             }
 
-            // 1. Analyze outer border (2-cell margin) for mean color AND dominant 1D stripe orientation
-            var sumBgY = 0; var sumBgU = 0; var sumBgV = 0; var bgCnt = 0
+            // 1. Estimate dominant 1D background stripe direction from outer border structure tensor
             var jxx = 0f; var jyy = 0f; var jxy = 0f
-
             for (gy in 1 until gridN - 1) {
                 for (gx in 1 until gridN - 1) {
-                    val isBorderRing = (gx <= 2 || gx >= gridN - 3 || gy <= 2 || gy >= gridN - 3)
-                    if (isBorderRing) {
+                    if (gx <= 2 || gx >= gridN - 3 || gy <= 2 || gy >= gridN - 3) {
                         val g = gy * gridN + gx
-                        sumBgY += cellY[g]
-                        sumBgU += cellU[g]
-                        sumBgV += cellV[g]
-                        bgCnt++
-
                         val dx = (cellY[g + 1] - cellY[g - 1]).toFloat()
                         val dy = (cellY[g + gridN] - cellY[g - gridN]).toFloat()
                         jxx += dx * dx
@@ -471,160 +465,210 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            val meanBgY = if (bgCnt > 0) sumBgY / bgCnt else 128
-            val meanBgU = if (bgCnt > 0) sumBgU / bgCnt else 128
-            val meanBgV = if (bgCnt > 0) sumBgV / bgCnt else 128
-
-            // Dominant background gradient unit vector (perpendicular to parallel stripes)
+            // Gradient angle is perpendicular to stripes; stripe direction is gradAngle + PI/2
             val gradAngle = 0.5f * atan2(2f * jxy, jxx - jyy)
-            val bgGradCos = cos(gradAngle)
-            val bgGradSin = sin(gradAngle)
-            val traceJ = jxx + jyy + 1f
-            val detJ = jxx * jyy - jxy * jxy
-            val coherence = sqrt(max(0f, traceJ * traceJ - 4f * detJ)) / traceJ // ~1.0 on striped mat, ~0 on plain table
+            val stripeAngle = gradAngle + (Math.PI / 2.0).toFloat()
+            val sCos = cos(stripeAngle)
+            val sSin = sin(stripeAngle)
 
-            // 2. Compute non-stripe boundary edge strength & local texture smoothness for each cell
-            val edgeDam = BooleanArray(numGrid)
-            val localSmooth = BooleanArray(numGrid)
-            val chromaDistinct = BooleanArray(numGrid)
+            // 2. For every interior cell (gx, gy), trace along +s and -s to the outer border ring
+            //    to predict the exact stripe color passing behind (gx, gy).
+            val rawFg = BooleanArray(numGrid)
 
-            for (gy in 1 until gridN - 1) {
-                for (gx in 1 until gridN - 1) {
+            for (gy in 2 until gridN - 2) {
+                for (gx in 2 until gridN - 2) {
                     val g = gy * gridN + gx
-                    val gxVal = (cellY[g + 1] - cellY[g - 1]) * 0.5f
-                    val gyVal = (cellY[g + gridN] - cellY[g - gridN]) * 0.5f
-                    val cuGrad = abs(cellU[g + 1] - cellU[g - 1]) + abs(cellU[g + gridN] - cellU[g - gridN])
-                    val cvGrad = abs(cellV[g + 1] - cellV[g - 1]) + abs(cellV[g + gridN] - cellV[g - gridN])
+                    val py = cellY[g]
+                    val pu = cellU[g]
+                    val pv = cellV[g]
 
-                    // Decompose luminance gradient into stripe-parallel vs. non-stripe (object contour) components
-                    val projStripe = gxVal * bgGradCos + gyVal * bgGradSin
-                    val crossStripe = -gxVal * bgGradSin + gyVal * bgGradCos
-                    val effectiveGradSq = if (coherence > 0.45f) {
-                        crossStripe * crossStripe + (projStripe * 0.35f).pow(2) + (cuGrad + cvGrad) * 6f
-                    } else {
-                        gxVal * gxVal + gyVal * gyVal + (cuGrad + cvGrad) * 6f
+                    // Ray-march to border in +s and -s directions
+                    var tPos = 1f
+                    var b1x = gx; var b1y = gy
+                    while (tPos < gridN) {
+                        val nx = (gx + tPos * sCos).roundToInt()
+                        val ny = (gy + tPos * sSin).roundToInt()
+                        if (nx <= 1 || nx >= gridN - 2 || ny <= 1 || ny >= gridN - 2) {
+                            b1x = nx.coerceIn(1, gridN - 2)
+                            b1y = ny.coerceIn(1, gridN - 2)
+                            break
+                        }
+                        tPos += 1f
                     }
 
-                    edgeDam[g] = effectiveGradSq > 260f
+                    var tNeg = 1f
+                    var b2x = gx; var b2y = gy
+                    while (tNeg < gridN) {
+                        val nx = (gx - tNeg * sCos).roundToInt()
+                        val ny = (gy - tNeg * sSin).roundToInt()
+                        if (nx <= 1 || nx >= gridN - 2 || ny <= 1 || ny >= gridN - 2) {
+                            b2x = nx.coerceIn(1, gridN - 2)
+                            b2y = ny.coerceIn(1, gridN - 2)
+                            break
+                        }
+                        tNeg += 1f
+                    }
 
-                    // Chrominance difference from background average (catches colored parts like pink cap)
-                    val du = cellU[g] - meanBgU
-                    val dv = cellV[g] - meanBgV
-                    chromaDistinct[g] = (du * du + dv * dv) > 140
+                    // Compare (py, pu, pv) against a 3x3 patch around both border stripe endpoints
+                    var minStripeDiff = Int.MAX_VALUE
+                    for (oy in -1..1) {
+                        for (ox in -1..1) {
+                            val idx1 = (b1y + oy).coerceIn(0, gridN - 1) * gridN + (b1x + ox).coerceIn(0, gridN - 1)
+                            val idx2 = (b2y + oy).coerceIn(0, gridN - 1) * gridN + (b2x + ox).coerceIn(0, gridN - 1)
 
-                    // Local 3x3 luminance variance (matte object interiors are much smoother than narrow rug stripes)
-                    var minLocalY = 255; var maxLocalY = 0
-                    for (ky in -1..1) {
-                        for (kx in -1..1) {
-                            val ny = cellY[(gy + ky) * gridN + (gx + kx)]
-                            if (ny < minLocalY) minLocalY = ny
-                            if (ny > maxLocalY) maxLocalY = ny
+                            val predY = (cellY[idx1] + cellY[idx2]) shr 1
+                            val predU = (cellU[idx1] + cellU[idx2]) shr 1
+                            val predV = (cellV[idx1] + cellV[idx2]) shr 1
+
+                            val dy = py - predY
+                            val du = (pu - predU) * 2
+                            val dv = (pv - predV) * 2
+                            val isSoftShadow = (dy in -45..-8) && (du * du + dv * dv < 140)
+                            val dSq = if (isSoftShadow) 0 else (dy * dy + du * du + dv * dv)
+                            if (dSq < minStripeDiff) minStripeDiff = dSq
+
+                            // Also check single-ended border match in case object touches one side
+                            val dy1 = py - cellY[idx1]
+                            val du1 = (pu - cellU[idx1]) * 2
+                            val dv1 = (pv - cellV[idx1]) * 2
+                            val dSq1 = dy1 * dy1 + du1 * du1 + dv1 * dv1
+                            if (dSq1 < minStripeDiff) minStripeDiff = dSq1
                         }
                     }
-                    localSmooth[g] = (maxLocalY - minLocalY) < 34
+
+                    // Derivative ALONG the stripe direction (zero on background stripes, high on object edges)
+                    val sxStep = sCos.roundToInt().coerceIn(-1, 1)
+                    val syStep = sSin.roundToInt().coerceIn(-1, 1)
+                    val gFwd = (gy + syStep) * gridN + (gx + sxStep)
+                    val gBwd = (gy - syStep) * gridN + (gx - sxStep)
+                    val alongStripeGrad = abs(cellY[gFwd] - cellY[gBwd]) +
+                        (abs(cellU[gFwd] - cellU[gBwd]) + abs(cellV[gFwd] - cellV[gBwd])) * 2
+
+                    rawFg[g] = (minStripeDiff > 320) || (alongStripeGrad > 36)
                 }
             }
 
-            // 3. Seeded Multi-Part Object Region Growing from the center reticle neighborhood
+            // 3. Morphological Closing (3x3 Dilation) + Outer-Border Background Flood Fill
+            //    so any internal patches inside the asset (glare, logos, matching stripe tone) are filled solid!
+            val dilatedFg = BooleanArray(numGrid)
+            for (gy in 2 until gridN - 2) {
+                for (gx in 2 until gridN - 2) {
+                    var countN = 0
+                    for (ky in -1..1) {
+                        for (kx in -1..1) {
+                            if (rawFg[(gy + ky) * gridN + (gx + kx)]) countN++
+                        }
+                    }
+                    dilatedFg[gy * gridN + gx] = countN >= 3
+                }
+            }
+
+            // Flood-fill "Outside Background" starting from all perimeter cells (gx <= 1 or gy <= 1 etc.)
+            val outsideBg = BooleanArray(numGrid)
+            val bgQueue = ArrayDeque<Int>()
+            for (gy in 0 until gridN) {
+                for (gx in 0 until gridN) {
+                    if (gx <= 1 || gx >= gridN - 2 || gy <= 1 || gy >= gridN - 2) {
+                        val bIdx = gy * gridN + gx
+                        outsideBg[bIdx] = true
+                        bgQueue.add(bIdx)
+                    }
+                }
+            }
+
+            while (!bgQueue.isEmpty()) {
+                val curr = bgQueue.removeFirst()
+                val cx = curr % gridN
+                val cy = curr / gridN
+                val edges = intArrayOf(
+                    cy * gridN + (cx - 1).coerceAtLeast(0),
+                    cy * gridN + (cx + 1).coerceAtMost(gridN - 1),
+                    (cy - 1).coerceAtLeast(0) * gridN + cx,
+                    (cy + 1).coerceAtMost(gridN - 1) * gridN + cx
+                )
+                for (nIdx in edges) {
+                    if (!outsideBg[nIdx] && !dilatedFg[nIdx]) {
+                        outsideBg[nIdx] = true
+                        bgQueue.add(nIdx)
+                    }
+                }
+            }
+
+            // Any cell NOT reached by the outside background flood is part of the solid closed object silhouette!
+            val solidSilhouette = BooleanArray(numGrid)
+            for (gy in 2 until gridN - 2) {
+                for (gx in 2 until gridN - 2) {
+                    var nonBgNeighbors = 0
+                    for (ky in -1..1) {
+                        for (kx in -1..1) {
+                            if (!outsideBg[(gy + ky) * gridN + (gx + kx)]) nonBgNeighbors++
+                        }
+                    }
+                    // Erode 1px back to undo the dilation margin and prune thin 1D noise
+                    solidSilhouette[gy * gridN + gx] = nonBgNeighbors >= 5
+                }
+            }
+
+            // 4. Extract the connected object component closest to the aiming center
             val centerG = gridN / 2
             var seedIdx = -1
-            var bestSeedScore = -1f
-
-            for (gy in (centerG - 4)..(centerG + 4)) {
-                for (gx in (centerG - 4)..(centerG + 4)) {
+            var bestDist = Int.MAX_VALUE
+            for (gy in 3 until gridN - 3) {
+                for (gx in 3 until gridN - 3) {
                     val g = gy * gridN + gx
-                    if (localSmooth[g] || chromaDistinct[g]) {
-                        val distPenalty = ((gx - centerG) * (gx - centerG) + (gy - centerG) * (gy - centerG)) * 2.5f
-                        val du = cellU[g] - meanBgU
-                        val dv = cellV[g] - meanBgV
-                        val dy = abs(cellY[g] - meanBgY)
-                        val score = (du * du + dv * dv) * 1.5f + dy * 1.2f + (if (localSmooth[g]) 60f else 0f) - distPenalty
-                        if (score > bestSeedScore) {
-                            bestSeedScore = score
+                    if (solidSilhouette[g]) {
+                        val d = (gx - centerG) * (gx - centerG) + (gy - centerG) * (gy - centerG)
+                        if (d < bestDist) {
+                            bestDist = d
                             seedIdx = g
                         }
                     }
                 }
             }
 
-            if (seedIdx == -1) {
+            if (seedIdx == -1 || bestDist > 45) {
                 liveClingConfidence = (liveClingConfidence - 1).coerceAtLeast(0)
                 if (liveClingConfidence == 0) hasLiveCling = false
                 return
             }
 
-            val seedY = cellY[seedIdx]
-            val seedU = cellU[seedIdx]
-            val seedV = cellV[seedIdx]
+            val compVisited = BooleanArray(numGrid)
+            val compQueue = ArrayDeque<Int>()
+            compQueue.add(seedIdx)
+            compVisited[seedIdx] = true
 
-            // Grow object mask from seedIdx, stopping at non-stripe edge dams OR border stripe leaks
-            val objMask = BooleanArray(numGrid)
-            val queue = ArrayDeque<Int>()
-            queue.add(seedIdx)
-            objMask[seedIdx] = true
+            val compX = mutableListOf<Float>()
+            val compY = mutableListOf<Float>()
+            var sumX = 0f
+            var sumY = 0f
 
-            while (!queue.isEmpty()) {
-                val curr = queue.removeFirst()
+            while (!compQueue.isEmpty()) {
+                val curr = compQueue.removeFirst()
                 val cx = curr % gridN
                 val cy = curr / gridN
-                val cY = cellY[curr]
-                val cU = cellU[curr]
-                val cV = cellV[curr]
+
+                val sx = viewPts[curr * 2]
+                val sy = viewPts[curr * 2 + 1]
+                compX.add(sx)
+                compY.add(sy)
+                sumX += sx
+                sumY += sy
 
                 for (ny in (cy - 1)..(cy + 1)) {
                     for (nx in (cx - 1)..(cx + 1)) {
                         if (nx in 2 until (gridN - 2) && ny in 2 until (gridN - 2)) {
                             val nIdx = ny * gridN + nx
-                            if (objMask[nIdx]) continue
-
-                            val stepY = abs(cellY[nIdx] - cY)
-                            val stepC = abs(cellU[nIdx] - cU) + abs(cellV[nIdx] - cV)
-                            val seedDiffY = abs(cellY[nIdx] - seedY)
-                            val seedDiffC = abs(cellU[nIdx] - seedU) + abs(cellV[nIdx] - seedV)
-
-                            // Allow smooth continuation of the seed part OR a contiguous colorful part (e.g. pink cap + white body)
-                            val samePart = (stepY <= 22 && stepC <= 18 && seedDiffY <= 55 && seedDiffC <= 32 && !edgeDam[nIdx])
-                            val adjacentDistinctPart = chromaDistinct[nIdx] && stepC <= 35
-
-                            if (samePart || adjacentDistinctPart) {
-                                objMask[nIdx] = true
-                                queue.add(nIdx)
+                            if (solidSilhouette[nIdx] && !compVisited[nIdx]) {
+                                compVisited[nIdx] = true
+                                compQueue.add(nIdx)
                             }
                         }
                     }
                 }
             }
 
-            // 4. Prune any 1D stripe tails that leaked along the background stripe axis
-            //    An object row/chord perpendicular to the stripe axis has width >= 3 cells; a leaked single stripe is 1-2 cells wide.
-            val prunedX = mutableListOf<Float>()
-            val prunedY = mutableListOf<Float>()
-            var sumX = 0f
-            var sumY = 0f
-
-            for (gy in 2 until gridN - 2) {
-                for (gx in 2 until gridN - 2) {
-                    val g = gy * gridN + gx
-                    if (!objMask[g]) continue
-                    var neighbors = 0
-                    for (ky in -1..1) {
-                        for (kx in -1..1) {
-                            if (objMask[(gy + ky) * gridN + (gx + kx)]) neighbors++
-                        }
-                    }
-                    if (neighbors >= 4) {
-                        val sx = viewPts[g * 2]
-                        val sy = viewPts[g * 2 + 1]
-                        prunedX.add(sx)
-                        prunedY.add(sy)
-                        sumX += sx
-                        sumY += sy
-                    }
-                }
-            }
-
-            val count = prunedX.size
-            if (count < 8 || count > (numGrid * 0.65f).toInt()) {
+            val count = compX.size
+            if (count < 12 || count > (numGrid * 0.72f).toInt()) {
                 liveClingConfidence = (liveClingConfidence - 1).coerceAtLeast(0)
                 if (liveClingConfidence == 0) hasLiveCling = false
                 return
@@ -644,8 +688,8 @@ class MainActivity : AppCompatActivity() {
                 var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
 
                 for (i in 0 until count) {
-                    val dx = prunedX[i] - barX
-                    val dy = prunedY[i] - barY
+                    val dx = compX[i] - barX
+                    val dy = compY[i] - barY
                     val pu = dx * c + dy * s
                     val pv = -dx * s + dy * c
                     if (pu < minU) minU = pu
@@ -653,7 +697,7 @@ class MainActivity : AppCompatActivity() {
                     if (pv < minV) minV = pv
                     if (pv > maxV) maxV = pv
                 }
-                val area = (maxU - minU).coerceAtLeast(10f) * (maxV - minV).coerceAtLeast(10f)
+                val area = (maxU - minU).coerceAtLeast(12f) * (maxV - minV).coerceAtLeast(12f)
                 if (area < bestArea) {
                     bestArea = area
                     bestRad = rad
@@ -667,19 +711,9 @@ class MainActivity : AppCompatActivity() {
 
             var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
             var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
-            var minScreenX = Float.MAX_VALUE; var maxScreenX = -Float.MAX_VALUE
-            var minScreenY = Float.MAX_VALUE; var maxScreenY = -Float.MAX_VALUE
-
             for (i in 0 until count) {
-                val sx = prunedX[i]
-                val sy = prunedY[i]
-                if (sx < minScreenX) minScreenX = sx
-                if (sx > maxScreenX) maxScreenX = sx
-                if (sy < minScreenY) minScreenY = sy
-                if (sy > maxScreenY) maxScreenY = sy
-
-                val dx = sx - barX
-                val dy = sy - barY
+                val dx = compX[i] - barX
+                val dy = compY[i] - barY
                 val pu = dx * uX + dy * uY
                 val pv = dx * vX + dy * vY
                 if (pu < minU) minU = pu
@@ -689,18 +723,17 @@ class MainActivity : AppCompatActivity() {
             }
 
             val cellStepPx = (roiHalf * 2f) / (gridN - 1)
-            val padPx = cellStepPx * 0.55f
+            val padPx = cellStepPx * 0.85f
             val midU = (minU + maxU) * 0.5f
             val midV = (minV + maxV) * 0.5f
-            val halfSpan1Px = ((maxU - minU) * 0.5f + padPx).coerceAtLeast(14f)
-            val halfSpan2Px = ((maxV - minV) * 0.5f + padPx).coerceAtLeast(14f)
+            val halfSpan1Px = ((maxU - minU) * 0.5f + padPx).coerceAtLeast(18f)
+            val halfSpan2Px = ((maxV - minV) * 0.5f + padPx).coerceAtLeast(18f)
 
             val boxScreenCX = barX + midU * uX + midV * vX
             val boxScreenCY = barY + midU * uY + midV * vY
 
-            // 6. Base-Grounded 3D Projection with Vertical Height-Relief Compensation:
-            //    For upright objects (like the deodorant bottle), maxScreenY is the physical base
-            //    touching the table, while minScreenY is elevated by object height H.
+            // 6. Unproject the 2D silhouette at the asset's 3D MID-HEIGHT plane (planeY + H/2)
+            //    so the 3D encapsulating ring is centered directly over the asset in perspective!
             val vMat = FloatArray(16)
             val pMat = FloatArray(16)
             val vpMat = FloatArray(16)
@@ -712,50 +745,32 @@ class MainActivity : AppCompatActivity() {
             Matrix.invertM(invVpMat, 0, vpMat, 0)
 
             val planeY = planeHitPose.ty()
-            val camPose = frame.camera.pose
+            val estMidY = planeY + liveHeight * 0.5f
 
-            // Unproject front-most base contact point (maxScreenY) and left/right base width
-            val baseContactScreenY = (maxScreenY + padPx).coerceAtMost(sHeight - 4f)
-            val baseMidScreenY = boxScreenCY * 0.45f + baseContactScreenY * 0.55f
+            val pCenterMid = intersectScreenRayWithHorizontalPlane(boxScreenCX, boxScreenCY, sWidth, sHeight, invVpMat, estMidY)
+            val p1AMid = intersectScreenRayWithHorizontalPlane(boxScreenCX + halfSpan1Px * uX, boxScreenCY + halfSpan1Px * uY, sWidth, sHeight, invVpMat, estMidY)
+            val p1BMid = intersectScreenRayWithHorizontalPlane(boxScreenCX - halfSpan1Px * uX, boxScreenCY - halfSpan1Px * uY, sWidth, sHeight, invVpMat, estMidY)
+            val p2AMid = intersectScreenRayWithHorizontalPlane(boxScreenCX + halfSpan2Px * vX, boxScreenCY + halfSpan2Px * vY, sWidth, sHeight, invVpMat, estMidY)
+            val p2BMid = intersectScreenRayWithHorizontalPlane(boxScreenCX - halfSpan2Px * vX, boxScreenCY - halfSpan2Px * vY, sWidth, sHeight, invVpMat, estMidY)
 
-            val pFrontBase = intersectScreenRayWithHorizontalPlane(boxScreenCX, baseContactScreenY, sWidth, sHeight, invVpMat, planeY)
-            val pLeftBase = intersectScreenRayWithHorizontalPlane(minScreenX - padPx, baseMidScreenY, sWidth, sHeight, invVpMat, planeY)
-            val pRightBase = intersectScreenRayWithHorizontalPlane(maxScreenX + padPx, baseMidScreenY, sWidth, sHeight, invVpMat, planeY)
+            if (pCenterMid == null || p1AMid == null || p1BMid == null || p2AMid == null || p2BMid == null) return
 
-            val p1AWorld = intersectScreenRayWithHorizontalPlane(boxScreenCX + halfSpan1Px * uX, baseMidScreenY + halfSpan1Px * uY * 0.65f, sWidth, sHeight, invVpMat, planeY)
-            val p1BWorld = intersectScreenRayWithHorizontalPlane(boxScreenCX - halfSpan1Px * uX, baseMidScreenY - halfSpan1Px * uY * 0.65f, sWidth, sHeight, invVpMat, planeY)
-            val p2AWorld = intersectScreenRayWithHorizontalPlane(boxScreenCX + halfSpan2Px * vX, baseMidScreenY + halfSpan2Px * vY * 0.65f, sWidth, sHeight, invVpMat, planeY)
-            val p2BWorld = intersectScreenRayWithHorizontalPlane(boxScreenCX - halfSpan2Px * vX, baseMidScreenY - halfSpan2Px * vY * 0.65f, sWidth, sHeight, invVpMat, planeY)
-
-            if (pFrontBase == null || pLeftBase == null || pRightBase == null || p1AWorld == null || p1BWorld == null || p2AWorld == null || p2BWorld == null) return
-
-            // True horizontal lateral width on the table (immune to vertical height relief)
-            val latWidth = sqrt((pRightBase[0] - pLeftBase[0]).pow(2) + (pRightBase[2] - pLeftBase[2]).pow(2)).coerceIn(0.04f, 0.35f)
-
-            val v1X = p1AWorld[0] - p1BWorld[0]
-            val v1Z = p1AWorld[2] - p1BWorld[2]
-            var span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceIn(0.04f, 0.35f)
+            val v1X = p1AMid[0] - p1BMid[0]
+            val v1Z = p1AMid[2] - p1BMid[2]
+            val span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceIn(0.045f, 0.40f)
             val u1X = v1X / span1
             val u1Z = v1Z / span1
 
-            val v2X = p2AWorld[0] - p2BWorld[0]
-            val v2Z = p2AWorld[2] - p2BWorld[2]
-            var span2 = sqrt(v2X * v2X + v2Z * v2Z).coerceIn(0.04f, 0.35f)
+            val v2X = p2AMid[0] - p2BMid[0]
+            val v2Z = p2AMid[2] - p2BMid[2]
+            val span2 = sqrt(v2X * v2X + v2Z * v2Z).coerceIn(0.045f, 0.40f)
             val u2X = v2X / span2
             val u2Z = v2Z / span2
 
-            // Clamp perspective depth stretch along the camera line of sight for upright cylinders/objects
-            span1 = min(span1, latWidth * 1.45f)
-            span2 = min(span2, latWidth * 1.45f)
-
-            val camToFrontX = pFrontBase[0] - camPose.tx()
-            val camToFrontZ = pFrontBase[2] - camPose.tz()
-            val camToFrontLen = sqrt(camToFrontX * camToFrontX + camToFrontZ * camToFrontZ).coerceAtLeast(0.05f)
-            val rayDirX = camToFrontX / camToFrontLen
-            val rayDirZ = camToFrontZ / camToFrontLen
-
-            val camDirX = -rayDirX
-            val camDirZ = -rayDirZ
+            val camPose = frame.camera.pose
+            val camAngle = atan2(camPose.tx() - pCenterMid[0], camPose.tz() - pCenterMid[2])
+            val camDirX = sin(camAngle)
+            val camDirZ = cos(camAngle)
 
             val dot0 = u1X * camDirX + u1Z * camDirZ
             val dot1 = -dot0
@@ -772,39 +787,35 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            val margin = 1.08f
+            val margin = 1.06f
             val targetW: Float
             val targetD: Float
             val targetHeading: Float
 
             when (bestIdx) {
                 0 -> {
-                    targetD = (span1 * margin).coerceIn(0.045f, 0.35f)
-                    targetW = (span2 * margin).coerceIn(0.045f, 0.35f)
+                    targetD = (span1 * margin).coerceIn(0.045f, 0.40f)
+                    targetW = (span2 * margin).coerceIn(0.045f, 0.40f)
                     targetHeading = atan2(u1X, u1Z)
                 }
                 1 -> {
-                    targetD = (span1 * margin).coerceIn(0.045f, 0.35f)
-                    targetW = (span2 * margin).coerceIn(0.045f, 0.35f)
+                    targetD = (span1 * margin).coerceIn(0.045f, 0.40f)
+                    targetW = (span2 * margin).coerceIn(0.045f, 0.40f)
                     targetHeading = atan2(-u1X, -u1Z)
                 }
                 2 -> {
-                    targetD = (span2 * margin).coerceIn(0.045f, 0.35f)
-                    targetW = (span1 * margin).coerceIn(0.045f, 0.35f)
+                    targetD = (span2 * margin).coerceIn(0.045f, 0.40f)
+                    targetW = (span1 * margin).coerceIn(0.045f, 0.40f)
                     targetHeading = atan2(u2X, u2Z)
                 }
                 else -> {
-                    targetD = (span2 * margin).coerceIn(0.045f, 0.35f)
-                    targetW = (span1 * margin).coerceIn(0.045f, 0.35f)
+                    targetD = (span2 * margin).coerceIn(0.045f, 0.40f)
+                    targetW = (span1 * margin).coerceIn(0.045f, 0.40f)
                     targetHeading = atan2(-u2X, -u2Z)
                 }
             }
 
-            // Place the 3D base center exactly targetD * 0.48f behind the front-most base edge on the table
-            val groundedCenterX = pFrontBase[0] + rayDirX * (targetD * 0.48f)
-            val groundedCenterZ = pFrontBase[2] + rayDirZ * (targetD * 0.48f)
-
-            var targetH = (min(targetW, targetD) * 0.55f).coerceIn(0.03f, 0.16f)
+            var targetH = (min(targetW, targetD) * 0.44f).coerceIn(0.032f, 0.14f)
             try {
                 val pc = frame.acquirePointCloud()
                 val pBuf = pc.points
@@ -814,9 +825,9 @@ class MainActivity : AppCompatActivity() {
                 val radiusLimit = max(targetW, targetD) * 0.65f
                 for (p in 0 until pCount) {
                     if (pBuf.get(p * 4 + 3) < 0.2f) continue
-                    val px = pBuf.get(p * 4) - groundedCenterX
+                    val px = pBuf.get(p * 4) - pCenterMid[0]
                     val py = pBuf.get(p * 4 + 1) - planeY
-                    val pz = pBuf.get(p * 4 + 2) - groundedCenterZ
+                    val pz = pBuf.get(p * 4 + 2) - pCenterMid[2]
                     if (py in 0.008f..0.28f && sqrt(px * px + pz * pz) <= radiusLimit) {
                         if (py > maxY) maxY = py
                         validPts++
@@ -824,14 +835,14 @@ class MainActivity : AppCompatActivity() {
                 }
                 pc.close()
                 if (validPts >= 3 && maxY > 0.015f) {
-                    targetH = (maxY * 1.15f).coerceIn(0.03f, 0.24f)
+                    targetH = (maxY * 1.15f).coerceIn(0.032f, 0.22f)
                 }
             } catch (e: Exception) {}
 
             if (!hasLiveCling) {
-                liveWorldX = groundedCenterX
+                liveWorldX = pCenterMid[0]
                 liveWorldY = planeY
-                liveWorldZ = groundedCenterZ
+                liveWorldZ = pCenterMid[2]
                 liveWidth = targetW
                 liveDepth = targetD
                 liveHeight = targetH
@@ -839,14 +850,14 @@ class MainActivity : AppCompatActivity() {
                 liveCos2A = cos(targetHeading * 2f)
                 liveSin2A = sin(targetHeading * 2f)
                 liveClingScreenX = boxScreenCX
-                liveClingScreenY = baseMidScreenY
+                liveClingScreenY = boxScreenCY
                 hasLiveCling = true
             } else {
                 val alphaPos = 0.35f
                 val alphaDim = 0.25f
-                liveWorldX += alphaPos * (groundedCenterX - liveWorldX)
+                liveWorldX += alphaPos * (pCenterMid[0] - liveWorldX)
                 liveWorldY = planeY
-                liveWorldZ += alphaPos * (groundedCenterZ - liveWorldZ)
+                liveWorldZ += alphaPos * (pCenterMid[2] - liveWorldZ)
                 liveWidth += alphaDim * (targetW - liveWidth)
                 liveDepth += alphaDim * (targetD - liveDepth)
                 liveHeight += alphaDim * (targetH - liveHeight)
@@ -860,7 +871,7 @@ class MainActivity : AppCompatActivity() {
                 liveAzimuth = smoothedAxis
 
                 liveClingScreenX += alphaPos * (boxScreenCX - liveClingScreenX)
-                liveClingScreenY += alphaPos * (baseMidScreenY - liveClingScreenY)
+                liveClingScreenY += alphaPos * (boxScreenCY - liveClingScreenY)
             }
             liveClingConfidence = (liveClingConfidence + 1).coerceAtMost(6)
 
@@ -897,7 +908,7 @@ class MainActivity : AppCompatActivity() {
                 val wCm = (prismWidth * 100).roundToInt()
                 val dCm = (prismDepth * 100).roundToInt()
                 val hCm = (prismHeight * 100).roundToInt()
-                logDebug("✓ Locked WebXR Ring Fit: ${wCm}x${dCm}x${hCm}cm")
+                logDebug("✓ Locked 3D Encapsulating Ring Fit: ${wCm}x${dCm}x${hCm}cm")
             } else {
                 val anchor = firstHit.createAnchor()
                 prismAnchor = anchor
@@ -996,11 +1007,11 @@ class MainActivity : AppCompatActivity() {
                     val wCm = (liveWidth * 100).roundToInt()
                     val dCm = (liveDepth * 100).roundToInt()
                     val hCm = (liveHeight * 100).roundToInt()
-                    distIndicator.text = "◎ RING CLING FIT: ${wCm}×${dCm}×${hCm}cm — TAP LOCK"
+                    distIndicator.text = "◎ 3D RING ENCAPSULATED: ${wCm}×${dCm}×${hCm}cm — TAP LOCK"
                     distIndicator.setTextColor(Color.parseColor("#3FB950"))
                     valScale.text = "RING: ${wCm}×${dCm}"
                 } else if (hit != null) {
-                    distIndicator.text = "SURFACE LOCKED: AIM RING AT ASSET"
+                    distIndicator.text = "SURFACE LOCKED: AIM 3D RING AT ASSET"
                     distIndicator.setTextColor(Color.parseColor("#58A6FF"))
                 } else {
                     distIndicator.text = "SCANNING FOR TABLE..."
@@ -1322,20 +1333,37 @@ class MainActivity : AppCompatActivity() {
         }
 
         private val webXrDiskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(45, 88, 166, 255)
+            color = Color.argb(40, 88, 166, 255)
+            style = Paint.Style.FILL
+        }
+
+        private val webXrWallBandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(42, 63, 185, 80)
             style = Paint.Style.FILL
         }
 
         private val webXrRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#58A6FF")
+            color = Color.parseColor("#3FB950")
             style = Paint.Style.STROKE
             strokeWidth = 5.0f
         }
 
+        private val webXrTopRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(230, 88, 235, 110)
+            style = Paint.Style.STROKE
+            strokeWidth = 3.8f
+        }
+
         private val webXrInnerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(170, 255, 255, 255)
+            color = Color.argb(180, 255, 255, 255)
             style = Paint.Style.STROKE
             strokeWidth = 2.2f
+        }
+
+        private val webXrRibPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(150, 63, 185, 80)
+            style = Paint.Style.STROKE
+            strokeWidth = 2.4f
         }
 
         private val viewMatrix = FloatArray(16)
@@ -1403,96 +1431,114 @@ class MainActivity : AppCompatActivity() {
             val screenH = height.toFloat()
 
             // =========================================================================
-            // PRE-LOCK PHASE: WEBXR SURFACE RING CLINGING AROUND THE ASSET
+            // PRE-LOCK PHASE: 3D VOLUMETRIC ENCAPSULATING RING AROUND THE ENTIRE ASSET
             // =========================================================================
             if (!isBoxPlaced) {
                 if (hasLiveCling) {
-                    val rx = (liveWidth * 0.54f).coerceIn(0.025f, 0.22f)
-                    val rz = (liveDepth * 0.54f).coerceIn(0.025f, 0.22f)
-                    val outerPts = mutableListOf<PointF?>()
-                    val innerPts = mutableListOf<PointF?>()
+                    // Circumscribing semi-axes (0.68x width/depth with superellipse contour)
+                    // so all 4 corners of rectangular boxes sit INSIDE the 3D ring!
+                    val rx = (liveWidth * 0.68f).coerceIn(0.032f, 0.26f)
+                    val rz = (liveDepth * 0.68f).coerceIn(0.032f, 0.26f)
+                    val ringH = liveHeight.coerceIn(0.032f, 0.22f)
+
+                    val basePts = mutableListOf<PointF?>()
+                    val midPts = mutableListOf<PointF?>()
+                    val topPts = mutableListOf<PointF?>()
+                    val innerBasePts = mutableListOf<PointF?>()
                     val steps = 36
 
                     for (i in 0 until steps) {
-                        val ang = (2.0 * Math.PI * i / steps).toFloat()
-                        val lx = rx * cos(ang)
-                        val lz = rz * sin(ang)
-                        outerPts.add(projectPoint(liveLocalToWorld(lx, 0f, lz), screenW, screenH))
-                        innerPts.add(projectPoint(liveLocalToWorld(lx * 0.80f, 0f, lz * 0.80f), screenW, screenH))
+                        val ang = (2.0 * Math.PI * i / steps)
+                        val c = cos(ang)
+                        val s = sin(ang)
+                        // Gentle superellipse (exponent 0.82) rounds out corners while encapsulating boxes & cases
+                        val lx = (rx * c.sign * abs(c).pow(0.82)).toFloat()
+                        val lz = (rz * s.sign * abs(s).pow(0.82)).toFloat()
+
+                        basePts.add(projectPoint(liveLocalToWorld(lx, 0f, lz), screenW, screenH))
+                        midPts.add(projectPoint(liveLocalToWorld(lx, ringH * 0.5f, lz), screenW, screenH))
+                        topPts.add(projectPoint(liveLocalToWorld(lx, ringH, lz), screenW, screenH))
+                        innerBasePts.add(projectPoint(liveLocalToWorld(lx * 0.86f, 0f, lz * 0.86f), screenW, screenH))
                     }
 
-                    webXrDiskPaint.color = Color.argb(48, 63, 185, 80)
-                    webXrRingPaint.color = Color.parseColor("#3FB950")
-
-                    if (outerPts.all { it != null }) {
-                        val diskPath = Path().apply {
-                            moveTo(outerPts[0]!!.x, outerPts[0]!!.y)
-                            for (i in 1 until outerPts.size) lineTo(outerPts[i]!!.x, outerPts[i]!!.y)
-                            close()
-                        }
-                        canvas.drawPath(diskPath, webXrDiskPaint)
-
-                        for (i in outerPts.indices) {
-                            val next = (i + 1) % outerPts.size
-                            canvas.drawLine(outerPts[i]!!.x, outerPts[i]!!.y, outerPts[next]!!.x, outerPts[next]!!.y, webXrRingPaint)
-                        }
-                    }
-
-                    if (innerPts.all { it != null } && outerPts.all { it != null }) {
-                        for (i in innerPts.indices) {
-                            val next = (i + 1) % innerPts.size
-                            if (i % 2 == 0) {
-                                canvas.drawLine(innerPts[i]!!.x, innerPts[i]!!.y, innerPts[next]!!.x, innerPts[next]!!.y, webXrInnerRingPaint)
+                    if (basePts.all { it != null } && topPts.all { it != null } && midPts.all { it != null }) {
+                        // 1. Translucent 3D Cylindrical Encapsulating Wall (connecting Base Ring y=0 to Top Ring y=H)
+                        for (i in 0 until steps) {
+                            val next = (i + 1) % steps
+                            val quadPath = Path().apply {
+                                moveTo(basePts[i]!!.x, basePts[i]!!.y)
+                                lineTo(basePts[next]!!.x, basePts[next]!!.y)
+                                lineTo(topPts[next]!!.x, topPts[next]!!.y)
+                                lineTo(topPts[i]!!.x, topPts[i]!!.y)
+                                close()
                             }
-                            // 4 cardinal orientation ticks around the WebXR ring
-                            if (i % 9 == 0) {
-                                canvas.drawLine(innerPts[i]!!.x, innerPts[i]!!.y, outerPts[i]!!.x, outerPts[i]!!.y, webXrRingPaint)
+                            canvas.drawPath(quadPath, webXrWallBandPaint)
+                        }
+
+                        // 2. Vertical 3D Ring Ribs around the perimeter (every 20 degrees)
+                        for (i in 0 until steps step 2) {
+                            canvas.drawLine(
+                                basePts[i]!!.x, basePts[i]!!.y,
+                                topPts[i]!!.x, topPts[i]!!.y,
+                                if (i % 9 == 0) webXrRingPaint else webXrRibPaint
+                            )
+                        }
+
+                        // 3. Mid-Height Equatorial Track Ring (y = H/2)
+                        for (i in 0 until steps step 2) {
+                            val next = (i + 1) % steps
+                            canvas.drawLine(midPts[i]!!.x, midPts[i]!!.y, midPts[next]!!.x, midPts[next]!!.y, webXrInnerRingPaint)
+                        }
+
+                        // 4. Base Ring on the Table (y = 0) + Inner Gauge Ring
+                        webXrRingPaint.color = Color.parseColor("#3FB950")
+                        for (i in 0 until steps) {
+                            val next = (i + 1) % steps
+                            canvas.drawLine(basePts[i]!!.x, basePts[i]!!.y, basePts[next]!!.x, basePts[next]!!.y, webXrRingPaint)
+                            if (innerBasePts[i] != null && innerBasePts[next] != null && i % 2 == 0) {
+                                canvas.drawLine(innerBasePts[i]!!.x, innerBasePts[i]!!.y, innerBasePts[next]!!.x, innerBasePts[next]!!.y, webXrInnerRingPaint)
                             }
                         }
-                    }
 
-                    val cp = projectPoint(floatArrayOf(liveWorldX, liveWorldY, liveWorldZ), screenW, screenH)
-                    if (cp != null) {
-                        canvas.drawCircle(cp.x, cp.y, 7f, webXrRingPaint)
+                        // 5. Top Crown Ring (y = H) encapsulating the upper face of the asset
+                        for (i in 0 until steps) {
+                            val next = (i + 1) % steps
+                            canvas.drawLine(topPts[i]!!.x, topPts[i]!!.y, topPts[next]!!.x, topPts[next]!!.y, webXrTopRingPaint)
+                        }
                     }
                     return
                 }
 
-                // Default WebXR ring when scanning empty surface
+                // Default 3D ring when scanning empty table surface
                 val hitResults = frame.hitTest(screenW / 2f, screenH / 2f)
                 val hit = hitResults.firstOrNull()
                 if (hit != null) {
                     val hp = hit.hitPose
-                    val diskRadius = 0.065f
-                    val pts = mutableListOf<PointF?>()
+                    val diskRadius = 0.075f
+                    val ringH = 0.035f
+                    val bPts = mutableListOf<PointF?>()
+                    val tPts = mutableListOf<PointF?>()
 
-                    webXrDiskPaint.color = Color.argb(45, 88, 166, 255)
+                    webXrDiskPaint.color = Color.argb(35, 88, 166, 255)
                     webXrRingPaint.color = Color.parseColor("#58A6FF")
 
                     for (i in 0 until 32) {
                         val ang = (2.0 * Math.PI * i / 32).toFloat()
                         val wx = hp.tx() + diskRadius * cos(ang)
-                        val wy = hp.ty()
                         val wz = hp.tz() + diskRadius * sin(ang)
-                        pts.add(projectPoint(wx, wy, wz, screenW, screenH))
+                        bPts.add(projectPoint(wx, hp.ty(), wz, screenW, screenH))
+                        tPts.add(projectPoint(wx, hp.ty() + ringH, wz, screenW, screenH))
                     }
 
-                    if (pts.all { it != null }) {
-                        val diskPath = Path().apply {
-                            moveTo(pts[0]!!.x, pts[0]!!.y)
-                            for (i in 1 until pts.size) lineTo(pts[i]!!.x, pts[i]!!.y)
-                            close()
+                    if (bPts.all { it != null } && tPts.all { it != null }) {
+                        for (i in bPts.indices) {
+                            val next = (i + 1) % bPts.size
+                            canvas.drawLine(bPts[i]!!.x, bPts[i]!!.y, bPts[next]!!.x, bPts[next]!!.y, webXrRingPaint)
+                            canvas.drawLine(tPts[i]!!.x, tPts[i]!!.y, tPts[next]!!.x, tPts[next]!!.y, webXrInnerRingPaint)
+                            if (i % 4 == 0) {
+                                canvas.drawLine(bPts[i]!!.x, bPts[i]!!.y, tPts[i]!!.x, tPts[i]!!.y, webXrInnerRingPaint)
+                            }
                         }
-                        canvas.drawPath(diskPath, webXrDiskPaint)
-                        for (i in pts.indices) {
-                            val next = (i + 1) % pts.size
-                            canvas.drawLine(pts[i]!!.x, pts[i]!!.y, pts[next]!!.x, pts[next]!!.y, webXrRingPaint)
-                        }
-                    }
-
-                    val cp = projectPoint(hp.tx(), hp.ty(), hp.tz(), screenW, screenH)
-                    if (cp != null) {
-                        canvas.drawCircle(cp.x, cp.y, 7f, webXrRingPaint)
                     }
                 }
                 return
